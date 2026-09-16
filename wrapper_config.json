@@ -1,0 +1,25 @@
+{
+    "lastools_path": "",
+    "default_parameters": {
+        "batch_size": 2,
+        "use_CPU_only": false,
+        "num_cpu_cores": 0,
+        "plot_radius": 0,
+        "plot_radius_buffer": 0,
+        "tree_base_cutoff_height": 5.0,
+        "ground_veg_cutoff_height": 3.0,
+        "slice_thickness": 0.15,
+        "slice_increment": 0.05,
+        "height_percentile": 100,
+        "sort_stems": true,
+        "generate_output_point_cloud": true,
+        "veg_sorting_range": 1.5,
+        "stem_sorting_range": 1.0,
+        "taper_measurement_height_min": 0,
+        "taper_measurement_height_max": 30,
+        "taper_measurement_height_increment": 0.2,
+        "taper_slice_thickness": 0.4,
+        "delete_working_directory": true,
+        "minimise_output_size_mode": 0
+    }
+}

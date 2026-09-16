@@ -1,0 +1,94 @@
+# FSCT requirements - Python 3.11
+#
+# This is the single requirements file. It covers the core pipeline, the
+# desktop app (fsct_desktop.py) and the browser UI (fsct_web.py). There
+# used to be three files - requirements.txt, requirements_gui.txt and
+# requirements_wrapper.txt - plus a fourth hardcoded list inside
+# FSCT.bat, which is how requirements.txt came to pin numpy<2.2 and
+# pandas<3.0 while the installer was actually producing numpy 2.4 and
+# pandas 3.0.
+#
+# The recommended install is FSCT.bat, which builds the 'lidar' conda
+# environment. It installs the binary-heavy packages from conda-forge and
+# PyTorch from the PyTorch wheel index, then runs `pip install -r` on this
+# file to pick up whatever is left. Every lower bound below is chosen to be
+# satisfied by what that install produces, so that final pip pass installs
+# the pure-Python packages and does not touch, downgrade or replace any
+# conda-forge build.
+#
+# For a plain venv instead, install in two commands:
+#
+#   pip install torch==2.5.1 \
+#       --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt \
+#       -f https://data.pyg.org/whl/torch-2.5.1+cu121.html
+#
+# Swap cu121 for cpu on machines without an Nvidia GPU.
+
+# --- deep learning ---------------------------------------------------
+#
+# The torch / torch-geometric / torch-cluster triple must be installed
+# together and must agree, or the segmentation model will not load.
+#
+# torch-scatter and torch-sparse are NOT required: torch-geometric 2.x
+# uses native torch scatter ops. Only torch-cluster is needed, for the
+# fps / radius / knn operators used by scripts/model.py.
+#
+# torchvision is deliberately absent, and must stay absent. Nothing in
+# FSCT imports it, and its bundled image DLLs shadow the ones conda-forge's
+# Pillow links against, which breaks _imaging - and therefore matplotlib
+# and the whole report writer - with
+# "DLL load failed ... The operating system cannot run %1".
+torch==2.5.1
+torch-geometric==2.6.1
+torch-cluster==1.6.3
+
+# --- scientific stack ------------------------------------------------
+#
+# Prefer the conda-forge builds of these. FSCT.bat installs them with
+# libblas=*=*openblas, because MKL 2026.1.0 fails to resolve a
+# delay-loaded export on Windows and numpy.linalg.svd / lstsq then kill
+# the process with 0xC06D007F and no traceback - which takes out cylinder
+# fitting entirely. The bounds here are deliberately open at the top so
+# pip accepts those builds rather than replacing them with PyPI wheels.
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+scikit-learn>=1.3
+scikit-image>=0.22
+matplotlib>=3.8
+networkx>=3.1
+hdbscan>=0.8.38
+scikit-spatial>=7.0
+python-louvain>=0.16
+
+# --- point clouds ----------------------------------------------------
+laspy>=2.5
+lazrs>=0.5
+
+# --- reporting -------------------------------------------------------
+# mdutils and Markdown are used by scripts/report_writer.py.
+mdutils>=1.6
+Markdown>=3.5
+Jinja2>=3.1
+rdflib>=7.0
+
+# --- desktop app (fsct_desktop.py) -----------------------------------
+# Theming only. The app falls back to plain ttk if this is missing.
+customtkinter>=5.2.0
+
+# --- browser UI (fsct_web.py) ----------------------------------------
+# statsmodels enables the OLS trendline on the DBH-vs-Height scatter;
+# visualization_utils.py falls back to a plain scatter without it.
+streamlit>=1.35
+plotly>=5.20
+pydeck>=0.9
+statsmodels>=0.14
+
+# --- misc ------------------------------------------------------------
+Pillow>=10.0
+PyWavelets>=1.4
+tqdm>=4.66
+joblib>=1.3
+fsspec>=2023.9
+requests>=2.31

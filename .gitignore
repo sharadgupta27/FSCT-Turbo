@@ -1,0 +1,95 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# ---------------------------------------------------------------------------
+# Machine-local state
+#
+# Both are written on this machine by the installer and the UIs, and both hold
+# absolute paths that mean nothing on anyone else's. gui_config.json is
+# recreated on first launch (setup_lastools.py writes the LAStools path into
+# it, and the app autodetects when it is missing); .fsct_setup is the stamp
+# FSCT.bat compares against SETUP_VERSION to decide whether to rebuild the
+# conda environment.
+# ---------------------------------------------------------------------------
+gui_config.json
+.fsct_setup
+
+# wrapper_config.json is NOT ignored: it ships the default parameter set for
+# batch_process.py and carries no machine-specific paths.
+
+# ---------------------------------------------------------------------------
+# Downloaded dependencies
+#
+# ~150 MB, fetched and unpacked by setup_lastools.py (FSCT.bat lastools).
+# ---------------------------------------------------------------------------
+third_party/LAStools/
+
+# ---------------------------------------------------------------------------
+# Pipeline output
+#
+# FSCT writes <input>_FSCT_output/ next to each input file, holding ~30 files
+# and a few hundred MB per plot. All of it is reproducible from the input.
+# ---------------------------------------------------------------------------
+*_FSCT_output/
+working_directory/
+
+# ---------------------------------------------------------------------------
+# Point clouds
+#
+# Survey data does not belong in git - data/ alone is 2.9 GB here. The single
+# exception is the benchmark file every timing in README.md and CHANGELOG.md is
+# measured against, so a clone can reproduce those numbers.
+#
+# Note the ordering: data/ is not excluded as a directory, because git cannot
+# re-include a file whose parent directory is excluded.
+# ---------------------------------------------------------------------------
+*.las
+*.laz
+*.ply
+*.e57
+*.pcd
+!data/test/example.las
+
+# ---------------------------------------------------------------------------
+# Training artefacts
+#
+# Written by scripts/train.py. The sample directories are the preprocessed
+# .npy boxes, regenerated from the training clouds.
+# ---------------------------------------------------------------------------
+data/*/sample_dir/
+*.npy
+model/training_history.csv
+model/training_history_permission_error_backup.csv
+
+# model/model.pth (74 MB) is deliberately NOT ignored - the tool cannot run
+# without it, and upstream FSCT ships it in-repo too. It is over GitHub's 50 MB
+# advisory threshold (under the 100 MB hard limit), so expect a large-file
+# warning on push. If that becomes a problem, track it with Git LFS rather than
+# dropping it:  git lfs track "model/*.pth"
+
+# ---------------------------------------------------------------------------
+# Editors and OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+*.log
