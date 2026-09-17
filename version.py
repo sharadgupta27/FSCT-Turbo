@@ -13,4 +13,4 @@ existing workflow, MINOR for new capability that leaves results alone, PATCH for
 fixes with no effect on output.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

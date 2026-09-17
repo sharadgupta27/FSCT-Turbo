@@ -52,39 +52,76 @@ class PostProcessing:
         ymax = np.ceil(np.max(self.terrain_points[:, 1])) + 3
         x_points = np.linspace(xmin, xmax, int(np.ceil((xmax - xmin) / self.parameters["grid_resolution"])) + 1)
         y_points = np.linspace(ymin, ymax, int(np.ceil((ymax - ymin) / self.parameters["grid_resolution"])) + 1)
-        # Collect rows in a list and stack once at the end. Growing the array
-        # with np.vstack inside the loop reallocated and copied the whole DTM
-        # on every cell, making this quadratic in the number of grid cells -
-        # a 100 x 100 m plot at 0.5 m resolution is 40,000 cells.
-        grid_rows = []
+        grid_resolution = self.parameters["grid_resolution"]
+        terrain_z = self.terrain_points[:, 2]
+        cloud_z = self.point_cloud[:, 2]
 
         # Bound on the widening search below. Without it, a cloud holding
         # fewer than 100 points in total would loop forever.
         max_radius = max(xmax - xmin, ymax - ymin)
 
-        for x in x_points:
-            for y in y_points:
-                radius = self.parameters["grid_resolution"] * 3
-                indices = terrain_kdtree.query_ball_point([x, y], r=radius)
-                while len(indices) <= 100 and radius <= self.parameters["grid_resolution"] * 5:
-                    radius += self.parameters["grid_resolution"]
-                    indices = terrain_kdtree.query_ball_point([x, y], r=radius)
-                if len(indices) >= 100:
-                    z = np.percentile(self.terrain_points[indices, 2], 20)
-                    grid_rows.append((x, y, z))
+        # All grid cells at once, in the order the old x-outer / y-inner loop
+        # visited them, so the DTM rows come out in the same order.
+        grid = np.stack(np.meshgrid(x_points, y_points, indexing="ij"), axis=-1).reshape(-1, 2)
+        num_cells = grid.shape[0]
 
-                else:
-                    indices = full_point_cloud_kdtree.query_ball_point([x, y], r=radius)
-                    while len(indices) <= 100 and radius <= max_radius:
-                        radius += self.parameters["grid_resolution"]
-                        indices = full_point_cloud_kdtree.query_ball_point([x, y], r=radius)
+        # The per-cell search widened the terrain query radius from 3 to 6
+        # grid cells, stopping at the first radius holding more than 100
+        # points. That is at most four radii, so the neighbour *counts* at all
+        # four can be taken for every cell in four threaded calls, without
+        # materialising any index lists, and each cell's stopping radius read
+        # off from them. The radii are accumulated by repeated addition exactly
+        # as the old loop did (rather than as k * resolution) so the float
+        # values - and so the inclusion of any point lying right on a
+        # boundary - are identical.
+        #
+        # This replaced a Python loop of two to eight cKDTree calls per cell -
+        # a 100 x 100 m plot at 0.5 m is 44,000 cells - each building and
+        # discarding a Python list of point indices just to take its length.
+        radii = [grid_resolution * 3]
+        for _ in range(3):
+            radii.append(radii[-1] + grid_resolution)
+        radii = np.array(radii)
+        counts = np.stack(
+            [terrain_kdtree.query_ball_point(grid, r=r, return_length=True, workers=-1) for r in radii],
+            axis=1,
+        )
+        exceeds = counts > 100
+        stop_index = np.where(exceeds.any(axis=1), exceeds.argmax(axis=1), radii.shape[0] - 1)
+        stop_radius = radii[stop_index]
+        stop_count = counts[np.arange(num_cells), stop_index]
+        from_terrain = stop_count >= 100
 
-                    if len(indices) == 0:
-                        continue
-                    z = np.percentile(self.point_cloud[indices, 2], 2.5)
-                    grid_rows.append((x, y, z))
+        grid_z = np.empty(num_cells)
+        keep = np.zeros(num_cells, dtype=bool)
 
-        grid_points = np.array(grid_rows, dtype=float) if grid_rows else np.zeros((0, 3))
+        # Cells with enough terrain returns: one batched query at each cell's
+        # own stopping radius, then the 20th percentile per cell.
+        terrain_cells = np.flatnonzero(from_terrain)
+        if terrain_cells.shape[0] > 0:
+            index_lists = terrain_kdtree.query_ball_point(
+                grid[terrain_cells], r=stop_radius[terrain_cells], workers=-1
+            )
+            for cell, indices in zip(terrain_cells, index_lists):
+                grid_z[cell] = np.percentile(terrain_z[indices], 20)
+            keep[terrain_cells] = True
+
+        # Cells without: fall back to the whole cloud, widening from where the
+        # terrain search left off. Same loop as before; these are normally the
+        # few cells around the plot edge.
+        for cell in np.flatnonzero(~from_terrain):
+            radius = stop_radius[cell]
+            indices = full_point_cloud_kdtree.query_ball_point(grid[cell], r=radius)
+            while len(indices) <= 100 and radius <= max_radius:
+                radius += grid_resolution
+                indices = full_point_cloud_kdtree.query_ball_point(grid[cell], r=radius)
+
+            if len(indices) == 0:
+                continue
+            grid_z[cell] = np.percentile(cloud_z[indices], 2.5)
+            keep[cell] = True
+
+        grid_points = np.column_stack((grid[keep], grid_z[keep])) if keep.any() else np.zeros((0, 3))
 
         if self.parameters["plot_radius"] > 0:
             plot_centre = [[float(self.plot_summary["Plot Centre X"].iloc[0]), float(self.plot_summary["Plot Centre Y"].iloc[0])]]

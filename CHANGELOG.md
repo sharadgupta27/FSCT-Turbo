@@ -5,6 +5,169 @@ existing workflow, MINOR for new capability that leaves results alone, PATCH for
 fixes with no effect on output. The version itself lives in `version.py`; run
 `FSCT.bat version` to print it.
 
+## 2.0.0
+
+A MAJOR bump because two reported measurements change: `Volume_1` in
+`tree_data.csv` was computed with a wrong formula, and `CCI_at_BH` was measured
+against the wrong points. Everything else here leaves results untouched, and
+was verified to: every CSV column and every LAS coordinate of
+`data/test/example_clean.las` matches the 1.0.0 output after the two
+measurement fixes, with the cylinder and stem files byte-identical. Regenerate
+any baseline you compare against.
+
+Benchmarks are on the same RTX 3050 / 16-core laptop as 1.0.0. It was far from
+idle this time — a WSL VM, an IDE and browsers held 12+ GB between them — so
+absolute times moved by 2x between runs and only back-to-back pairs are quoted.
+
+### Large point clouds no longer crash
+
+`data/test/ID0827_thin.las` — 5.1 million points, a 20 x 20 m plot — died at
+the end of segmentation on a 16 GB machine:
+
+    numpy._core._exceptions._ArrayMemoryError: Unable to allocate 623. MiB
+    for an array with shape (5104837, 16) and data type float64
+
+after the GPU had already done all its work. `choose_most_confident_label`
+asked the kNN for distances it never used (a second `(N, 16)` array) and took
+the median over one `(N, 16, 4)` gather, which numpy then needed a working copy
+of — about 3.5 GB of temporaries for 5 million points. The medians are taken a
+block of 250,000 points at a time now, with peak memory set by the block size
+rather than the plot, and the per-box network output is released before the
+labelled cloud is written. Labels are identical (checked on 673k points against
+the old code). The same file now completes end to end: **156 s** on a quiet
+machine, 270–280 s under load.
+
+Two more allocation patterns that scale with the cloud were fixed on the way:
+`load_file` rebuilt the whole cloud once per column it read (seven copies for
+xyz + rgb + label), and `save_file` called `las.add_extra_dim` once per extra
+column, each call copying the entire point record — 7 s of the post-processing
+stage on the 5M-point file. Both now do one allocation.
+
+### Measurement fixes
+
+- **`Volume_1` was wrong twice over.** The frustum volume between consecutive
+  cylinders read `(1/3) pi h (r1² + r1 + r2² + r2)` — adding a length to an
+  area — where a frustum is `(1/3) pi h (r1² + r1·r2 + r2²)`; at r1 = 0.5 m,
+  r2 = 0.3 m that overstates a segment by 2.3x. And the function's parameters
+  were named `diameter_1`, `diameter_2` and halved on entry, while its only
+  caller passes radii, so every radius was halved a second time. The two errors
+  partly cancelled, which is why the numbers looked plausible. On the example
+  plot tree 1's `Volume_1` moves from 1.61 m³ to 0.66 m³ — the old value
+  exceeded a solid cylinder of the tree's own DBH over its full height, which no
+  tapering stem can do; the new one sits beside `Volume_2` (0.53 m³), which is
+  estimated independently from DBH and height and never went through this code.
+- **`CCI_at_BH` used every tree's stem points.** The breast-height slice was
+  cut from the whole plot's stem cloud, not the tree's, so a neighbouring stem
+  falling in the 0.8–1.2 r annulus counted as coverage of this tree's
+  circumference. It is now the tree's own points. On the sparse example plot
+  the values happen not to change; on a dense plot they will.
+- **Branch-to-parent interpolation matched the wrong parent.** Two bugs in the
+  same block: `np.mean(parent_branch[:, :3])` with no axis returned a single
+  number instead of a centroid, and `np.linalg.norm(...)` with no axis likewise,
+  so `argmin` was always 0 and "the closest point of the current branch" was
+  whatever row came first. Then the candidate angles were filtered in place and
+  `argmin` of the *filtered* array was used to index the *unfiltered* candidate
+  list, picking a different cylinder than the one with the smallest angle. Both
+  fixed. They did not change the example plot's outputs, since they only bite
+  when a branch has several parent candidates within `max_search_radius`.
+- **The "VOLUME 2" annotation line was missing** from `text_point_cloud.las` in
+  the default (uncropped) mode; only the tree-aware-cropping branch stacked it.
+- **Division by zero on degenerate plots.** The coverage fractions and
+  `Stems/ha` divided by the sample-cell count and the plot area with no guard;
+  a plot whose DTM hull contained no grid cell, or with zero hull area, took the
+  whole run down with `ZeroDivisionError` — once at the very end, after all the
+  work was done. They now report 0.
+- **`save_file` silently wrote nothing** for `.LAS` (upper case) or `.laz`: the
+  extension check was `filename[-4:] == ".las"`, so neither branch matched and
+  the function returned without an error. It now matches case-insensitively,
+  like `load_file`, and raises on an unsupported extension.
+- **Multi-core subsampling results depended on worker scheduling.** The
+  subsampled slices were collected with `imap_unordered`, so the row order of
+  the thinned cloud — and of everything derived from it — varied run to run.
+  Now `imap`. Only reachable with `subsample` enabled.
+
+One more found and deliberately left alone: the step that was meant to fold
+DBSCAN's leftover "noise" skeleton points into their nearest cluster never did
+anything. It wrote through a chained fancy index (into a temporary that was
+discarded) *and* searched for neighbours only among the other unassigned points,
+whose label is -1 by definition. Those points are silently dropped today.
+`assign_unassigned_skeleton_points` in `other_parameters.py` makes the step work
+as described and is **off by default**, because recovering skeleton points
+changes which stems get cylinders fitted.
+
+### Speed
+
+Measurement stage on `example_clean.las`, 16 workers, back to back:
+**20.0 s → 13.7 s**; the fastest of three later runs was 10.0 s against a
+1.0.0 baseline of 18.2 s taken under the same conditions.
+
+What the profile said, and what changed:
+
+- **Worker start-up outweighed the work three to one.** Sampled across all 16
+  workers, 146 s of CPU went on imports — each worker re-importing numpy,
+  scipy, sklearn, pandas, networkx, laspy and hdbscan from a bare interpreter,
+  about 9 s each under contention — against 54 s of actual clustering and
+  circle fitting. pandas, networkx, laspy, skspatial and DBSCAN are only ever
+  used by the parent and are now imported where they are used, taking a worker's
+  import from 4.0 s to 3.3 s (sklearn, which hdbscan needs, is the floor).
+  More usefully, the pool is now started **before segmentation** with a Pool
+  initializer that forces those imports, so the workers come up while the GPU
+  is busy and the CPU is idle, and are ready when measurement begins. This is
+  gated on free memory: idle workers hold ~150 MB each and segmentation is
+  where the parent's own memory peaks, so on a machine that is already paging
+  the pool starts at the measurement stage as before. `prewarm_worker_pool` in
+  `other_parameters.py` turns it off.
+- **No more barriers between task batches.** Tasks were submitted in batches of
+  128 with a wait for the whole batch after each, so one big stem cluster
+  idled the other 15 workers until it finished — 32 s of worker CPU for
+  cylinder fitting took 7.4 s of wall. Submission is now a sliding window
+  (a semaphore keeps the same bound on tasks in flight), results are taken in
+  completion order and slotted back by index, and tasks are submitted largest
+  first. Every task is seeded per cluster, so neither order changes any output.
+- **The DTM was re-triangulated twice per tree.** `griddata` builds a Delaunay
+  triangulation on every call and measurement called it once per tree in the
+  interpolation loop, once per tree when collecting tree data, and once per
+  tree to find the base height — for one point. `DTMInterpolator` builds it
+  once; identical values (`griddata(method="linear")` *is*
+  `LinearNDInterpolator`). 20 per-tree calls against a 4,000-point DTM: 0.96 s
+  → 0.22 s; against 20,000 points: 7.3 s → 0.75 s.
+- **Skeleton-to-stem-point matching was brute force.** The cKDTrees for it were
+  built with `leafsize=100000`, which makes the dual-tree query compare every
+  skeleton point against every stem point. Leaf size changes only how the same
+  neighbour sets are found: 3.65 s → 0.04 s on a synthetic 300k × 6k match,
+  identical sets. The per-cluster boolean scans of the skeleton array and the
+  per-cluster tree builds around it are replaced by one query and one grouping.
+- **Quadratic array growth** in the tree-data loop (six arrays re-stacked per
+  tree, two of them whole point clouds), the cylinder-interpolation loop (three
+  nesting levels deep) and the skeleton visualisation, and the per-tree boolean
+  scans of the vegetation and stem clouds — millions of rows scanned once per
+  tree. All now group once and stack once.
+- **Canopy / understorey / CWD cover** ran a Python loop over every 0.2 m grid
+  cell with a generator-based convex-hull test and three `query_ball_point`
+  calls per cell, each building an index list just to take its length. One
+  matrix product for the hull test and three threaded counting queries.
+- **DTM construction** — the per-cell radius-widening search over the terrain
+  tree is done as four threaded counting queries over all cells at once, with
+  the radii accumulated exactly as the loop did so boundary points land the
+  same side; identical DTMs at 0.5 m and 0.3 m. The vegetation and stem
+  sorting queries run on all cores.
+- The point-based text annotations grew their array one point at a time in a
+  nested Python loop over the character bitmap; `np.argwhere` gives the same
+  points in the same order, 26x faster, seven times per tree.
+
+### A dead worker no longer hangs the run
+
+If a worker process is killed — the OS reclaiming memory is the usual cause —
+`multiprocessing.Pool` starts a replacement but never re-runs the task the
+dead one was holding, and `imap` waits for it forever. In the desktop app that
+was a run that never finished, with no error anywhere. The result loop now
+polls with a timeout and, if the pool's worker set has changed, raises an
+error that says what happened and what to try. `close_pool` uses `terminate()`
+rather than `close()` + `join()`, since after a lost task the pool's result
+cache never drains and `join()` never returned either — the raised error was
+never reaching the user. Verified by killing a worker mid-task: error in 30 s,
+clean shutdown.
+
 ## 1.0.0
 
 First versioned release.

@@ -1,14 +1,24 @@
 from sklearn.neighbors import NearestNeighbors
 import numpy as np
-import laspy
 from multiprocessing import get_context, current_process
-import pandas as pd
 import os
 import shutil
-from sklearn.cluster import DBSCAN
-from scipy.interpolate import griddata
 from copy import deepcopy
 import hdbscan
+
+# laspy, pandas, sklearn.cluster and scipy.interpolate are imported inside
+# the functions that use them rather than here.
+#
+# This module is imported by every worker process the measurement stage
+# spawns, and a spawned worker on Windows starts from a bare interpreter:
+# everything at module scope here and in measure.py is re-imported, per
+# worker, before it can run its first task. Profiled with 16 workers, that
+# was 146 s of CPU spent importing against 54 s spent on the actual
+# clustering and circle fitting - the imports outweighed the work nearly
+# three to one, and most of it was for modules the workers never touch.
+# The workers need numpy, scipy.spatial, sklearn.neighbors and hdbscan.
+# File I/O, DBSCAN and the DTM interpolator only ever run in the parent,
+# so importing them on first use keeps them out of the workers entirely.
 
 
 def get_fsct_path(location_in_fsct=""):
@@ -134,10 +144,21 @@ def subsample_point_cloud(pointcloud, min_spacing, num_cpu_cores=1):
             print("Slice size:", pc_slice.shape[0], "    Slice number:", i + 1, "/", num_slices)
             slice_list.append([pc_slice, min_spacing, lo, hi])
 
-        pointcloud = np.zeros((0, pointcloud.shape[1]))
+        num_columns = pointcloud.shape[1]
+        # Collected and stacked once at the end. Stacking each slice onto the
+        # running result copied every point kept so far, once per slice.
+        #
+        # imap, not imap_unordered: the slices are independent, so taking the
+        # results in completion order made the row order of the subsampled
+        # cloud depend on worker scheduling, and every array derived from it
+        # downstream inherited that. Ordering costs nothing here and is what
+        # random_seed needs to actually make a rerun reproducible.
+        kept_slices = []
         with get_context("spawn").Pool(processes=num_cpu_cores) as pool:
-            for i in pool.imap_unordered(subsample, slice_list):
-                pointcloud = np.vstack((pointcloud, i))
+            for i in pool.imap(subsample, slice_list):
+                kept_slices.append(i)
+        del slice_list
+        pointcloud = np.vstack(kept_slices) if kept_slices else np.zeros((0, num_columns))
 
     else:
         pointcloud = subsample([pointcloud, min_spacing])
@@ -168,6 +189,8 @@ def load_file(
     output_headers = []
 
     if file_extension == ".las" or file_extension == ".laz":
+        import laspy
+
         try:
             inFile = laspy.read(filename)
         except FileNotFoundError:
@@ -178,16 +201,25 @@ def load_file(
                 return np.zeros((0, 3)), None
 
         header_names = list(inFile.point_format.dimension_names)
-        pointcloud = np.vstack((inFile.x, inFile.y, inFile.z))
+        # Collect the columns and stack once. Every np.vstack call allocates a
+        # whole new (rows, N) array and copies everything gathered so far into
+        # it, so reading x, y, z plus six optional headers rebuilt the cloud
+        # seven times over; at 5 million points each of those copies is
+        # hundreds of megabytes, which is both slow and the difference between
+        # fitting in memory and not.
+        columns = [np.asarray(inFile.x), np.asarray(inFile.y), np.asarray(inFile.z)]
         if len(headers_of_interest) != 0:
             headers_of_interest = headers_of_interest[3:]
             for header in headers_of_interest:
                 if header in header_names:
-                    pointcloud = np.vstack((pointcloud, getattr(inFile, header)))
+                    columns.append(np.asarray(getattr(inFile, header)))
                     output_headers.append(header)
-        pointcloud = pointcloud.transpose()
+        pointcloud = np.vstack(columns).transpose()
+        del columns
 
     elif file_extension == ".csv":
+        import pandas as pd
+
         # delim_whitespace was deprecated in pandas 2.2 and removed in 3.0.
         pointcloud = np.array(pd.read_csv(filename, header=None, index_col=None, sep=r"\s+"))
 
@@ -226,7 +258,15 @@ def save_file(filename, pointcloud, headers_of_interest=None, silent=False):
     else:
         if not silent:
             print("Saving file:", filename)
-        if filename[-4:] == ".las":
+        # Match the extension the way load_file does. "filename[-4:] == '.las'"
+        # is case-sensitive and exactly four characters, so ".LAS" and ".laz"
+        # matched neither branch and the function returned having written
+        # nothing at all - no file, no error, and the next stage failed later
+        # with a confusing FileNotFoundError about a file it never saw created.
+        file_extension = os.path.splitext(filename)[1].lower()
+        if file_extension in (".las", ".laz"):
+            import laspy
+
             las = laspy.create(file_version="1.4", point_format=7)
             las.header.offsets = np.min(pointcloud[:, :3], axis=0)
             las.header.scales = [0.001, 0.001, 0.001]
@@ -243,30 +283,85 @@ def save_file(filename, pointcloud, headers_of_interest=None, silent=False):
                 headers_of_interest.reverse()
 
                 col_idxs.reverse()
+                # Declare every extra dimension in one call before filling any.
+                # laspy rebuilds the entire point record each time a dimension
+                # is added, copying every point already in it, so adding them
+                # one at a time cost one full copy of the cloud per extra
+                # column - 7 s of the post-processing stage on a 5M point
+                # cloud. The dimensions are declared in the same order the old
+                # loop added them, so the file layout is unchanged.
+                extra_dims = [
+                    laspy.ExtraBytesParams(name=header, type="f8")
+                    for header in headers_of_interest
+                    if header not in ["red", "green", "blue"]
+                ]
+                if extra_dims:
+                    las.add_extra_dims(extra_dims)
                 for header, i in zip(headers_of_interest, col_idxs):
-                    column = pointcloud[:, i]
-                    if header in ["red", "green", "blue"]:
-                        setattr(las, header, column)
-                    else:
-                        las.add_extra_dim(laspy.ExtraBytesParams(name=header, type="f8"))
-                        setattr(las, header, column)
+                    setattr(las, header, pointcloud[:, i])
             las.write(filename)
             if not silent:
                 print("Saved.")
 
-        elif filename[-4:] == ".csv":
+        elif file_extension == ".csv":
+            import pandas as pd
+
             pd.DataFrame(pointcloud).to_csv(filename, header=None, index=None, sep=" ")
             print("Saved to:", filename)
 
+        else:
+            raise ValueError(
+                f"Unsupported point cloud format {file_extension!r} for {filename}. "
+                "Expected .las, .laz or .csv."
+            )
 
-def get_heights_above_DTM(points, DTM):
+
+class DTMInterpolator:
+    """
+    A reusable linear interpolator over a DTM.
+
+    scipy's griddata builds a Delaunay triangulation of the input points on
+    every call and throws it away again. That triangulation is by far the
+    expensive part, it depends only on the DTM, and the DTM does not change
+    during a run - but measure.py calls get_heights_above_DTM once per tree in
+    the interpolation loop and again once per tree when collecting tree data,
+    so a plot with 200 trees triangulated the same few thousand DTM points 400
+    times over.
+
+    Building it once and calling it many times gives identical values:
+    griddata(method="linear") is exactly LinearNDInterpolator with the same
+    fill_value and no rescaling.
+    """
+
+    def __init__(self, DTM):
+        from scipy.interpolate import LinearNDInterpolator
+
+        self._interpolator = LinearNDInterpolator(
+            np.ascontiguousarray(DTM[:, :2]), np.ascontiguousarray(DTM[:, 2]), fill_value=np.median(DTM[:, 2])
+        )
+
+    def __call__(self, xy):
+        return self._interpolator(xy)
+
+
+def get_heights_above_DTM(points, DTM, interpolator=None):
+    """
+    Write each point's height above the DTM into its last column.
+
+    `interpolator` is an optional prebuilt DTMInterpolator for this DTM. Pass
+    one when calling this repeatedly against the same DTM; without it a fresh
+    triangulation is built per call, which is what the original did.
+    """
     print("Getting heights above DTM...")
-    grid = griddata((DTM[:, 0], DTM[:, 1]), DTM[:, 2], points[:, 0:2], method="linear", fill_value=np.median(DTM[:, 2]))
-    points[:, -1] = points[:, 2] - grid
+    if interpolator is None:
+        interpolator = DTMInterpolator(DTM)
+    points[:, -1] = points[:, 2] - interpolator(points[:, 0:2])
     return points
 
 
 def cluster_dbscan(points, eps=0.05, min_samples=2, n_jobs=1):
+    from sklearn.cluster import DBSCAN
+
     db = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean", algorithm="kd_tree", n_jobs=n_jobs).fit(
         points[:, :3]
     )
@@ -317,6 +412,8 @@ def clustering(points, eps=0.05, min_samples=2, n_jobs=1, mode="DBSCAN"):
         return np.hstack((points, np.atleast_2d(cluster_labels).T))
 
     elif mode == "DBSCAN":
+        from sklearn.cluster import DBSCAN
+
         db = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean", algorithm="kd_tree", n_jobs=n_jobs).fit(
             points[:, :3]
         )

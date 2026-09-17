@@ -1,17 +1,54 @@
 import math
+import threading
 from copy import deepcopy
-from multiprocessing import get_context
-import networkx as nx
+from multiprocessing import get_context, TimeoutError
 import numpy as np
-import pandas as pd
 import os
 from scipy import spatial  # TODO Test if sklearn kdtree is faster.
-from scipy.interpolate import griddata
-from tools import get_fsct_path, load_file, save_file, low_resolution_hack_mode, cluster_hdbscan, cluster_dbscan, get_heights_above_DTM, get_taper
+
+# pandas, networkx and skspatial are imported where they are used, in
+# methods that only the parent process calls. Every worker in the
+# measurement pool re-imports this module from scratch (see the note at
+# the top of tools.py), and those three alone were about a third of that
+# cost for modules the workers have no use for.
+from tools import (
+    get_fsct_path,
+    load_file,
+    save_file,
+    low_resolution_hack_mode,
+    cluster_hdbscan,
+    cluster_dbscan,
+    get_heights_above_DTM,
+    get_taper,
+    DTMInterpolator,
+)
 from fsct_exceptions import DataQualityError
 import time
-from skspatial.objects import Plane
 from sklearn.neighbors import BallTree
+
+
+def _indexed_call(task):
+    """Pool trampoline: run task's function on its item, returning (index, result)."""
+    index, func, item = task
+    return index, func(item)
+
+
+def _initialise_worker():
+    """
+    Pool initializer: runs once in each worker as soon as it starts.
+
+    It does nothing itself. Its job is done by the time it is called: to run
+    it, the worker has to unpickle a reference to this function, and that
+    means importing this module - and with it tools, scipy.spatial,
+    sklearn.neighbors and hdbscan, everything a task will need.
+
+    Without it a spawned worker imports those only when its *first task*
+    arrives, since that is the first thing it unpickles that lives here. So
+    the pool that run_tools.FSCT starts ahead of segmentation would have sat
+    through the whole GPU stage as sixteen bare interpreters and then all
+    imported at once the moment measurement began, which is the exact
+    start-up cost the early start is meant to hide.
+    """
 
 
 class MeasureTree:
@@ -31,6 +68,8 @@ class MeasureTree:
         self.num_neighbours = parameters["num_neighbours"]
         self.slice_thickness = parameters["slice_thickness"]
         self.slice_increment = parameters["slice_increment"]
+
+        import pandas as pd
 
         self.plot_summary = pd.read_csv(self.output_dir + "plot_summary.csv", index_col=False)
         self.parameters["plot_radius"] = float(self.plot_summary["Plot Radius"].iloc[0])
@@ -53,6 +92,10 @@ class MeasureTree:
             save_file(self.output_dir + self.filename[:-4] + "_stem_points_hack_mode_cloud.las", self.stem_points)
 
         self.DTM, headers_of_interest = load_file(self.output_dir + "DTM.las")
+        # Triangulate the DTM once and reuse it. Every height-above-DTM
+        # lookup below goes through this; building it per call meant
+        # re-triangulating the whole DTM twice for every tree in the plot.
+        self.dtm_interpolator = DTMInterpolator(self.DTM)
         self.characters = [
             "0",
             "1",
@@ -194,35 +237,50 @@ class MeasureTree:
         )
 
         convexhull = spatial.ConvexHull(self.DTM[:, :2])
-        self.ground_area = 0  # unitless. Not in m2.
-        self.canopy_area = 0  # unitless. Not in m2.
-        self.ground_veg_area = 0  # unitless. Not in m2.
-        self.cwd_area = 0  # unitless. Not in m2.
-        for x in x_points:
-            for y in y_points:
-                if self.inside_conv_hull(np.array([x, y]), convexhull):
-                    indices = veg_kdtree.query_ball_point(
-                        [x, y], r=self.parameters["vegetation_coverage_resolution"], p=10
-                    )
-                    ground_veg_indices = self.ground_veg_kdtree.query_ball_point(
-                        [x, y], r=self.parameters["vegetation_coverage_resolution"], p=10
-                    )
-                    cwd_indices = cwd_kdtree.query_ball_point(
-                        [x, y], r=self.parameters["vegetation_coverage_resolution"], p=10
-                    )
-                    self.ground_area += 1
-                    if len(indices) > 5:
-                        self.canopy_area += 1
 
-                    if len(ground_veg_indices) > 5:
-                        self.ground_veg_area += 1
+        # Coverage fractions over the sample grid, computed as whole arrays.
+        #
+        # This was a Python double loop over every grid cell - a 100 x 100 m
+        # plot at the default 0.2 m resolution is 250,000 of them - and each
+        # cell ran inside_conv_hull, which is a Python generator over every
+        # facet of the hull, then three separate query_ball_point calls that
+        # each built a Python list of point indices only for len() to be taken
+        # of it.
+        #
+        # Identical arithmetic, three orders of magnitude fewer interpreter
+        # round trips: the hull test is one matrix product for all cells at
+        # once, and cKDTree answers all the cells in a single threaded call
+        # with return_length=True, which counts the neighbours without
+        # materialising the index lists.
+        grid = np.stack(np.meshgrid(x_points, y_points, indexing="ij"), axis=-1).reshape(-1, 2)
 
-                    if len(cwd_indices) > 5:
-                        self.cwd_area += 1
+        # hull.equations is [normal | offset]; a point is inside when
+        # normal . point + offset <= tolerance for every facet. Same test and
+        # same tolerance as inside_conv_hull, done for all points at once.
+        hull_eq = convexhull.equations
+        inside = np.all(grid @ hull_eq[:, :-1].T + hull_eq[:, -1] <= 1e-5, axis=1)
+        grid = grid[inside]
 
-        print("Canopy Cover Fraction:", self.canopy_area / self.ground_area)
-        print("Understory Veg Fraction:", self.ground_veg_area / self.ground_area)
-        print("Coarse Woody Debris Fraction:", self.cwd_area / self.ground_area)
+        self.ground_area = int(grid.shape[0])  # unitless. Not in m2.
+        resolution = self.parameters["vegetation_coverage_resolution"]
+
+        def _covered_cells(kdtree):
+            if grid.shape[0] == 0:
+                return 0
+            counts = kdtree.query_ball_point(grid, r=resolution, p=10, return_length=True, workers=-1)
+            return int(np.count_nonzero(counts > 5))
+
+        self.canopy_area = _covered_cells(veg_kdtree)  # unitless. Not in m2.
+        self.ground_veg_area = _covered_cells(self.ground_veg_kdtree)  # unitless. Not in m2.
+        self.cwd_area = _covered_cells(cwd_kdtree)  # unitless. Not in m2.
+
+        # A plot whose DTM hull contains no grid cell at all used to divide by
+        # zero here and take the whole run down with a ZeroDivisionError.
+        if self.ground_area == 0:
+            print("No sample cells fell inside the DTM hull; coverage fractions are reported as 0.")
+        print("Canopy Cover Fraction:", self.canopy_cover_fraction)
+        print("Understory Veg Fraction:", self.understory_veg_fraction)
+        print("Coarse Woody Debris Fraction:", self.cwd_fraction)
         max_z = np.max(
             np.hstack(
                 (
@@ -247,6 +305,32 @@ class MeasureTree:
         self.text_point_cloud = np.zeros((0, 3))
         self.tree_measurements = np.zeros((0, 8))
         self.text_point_cloud = np.zeros((0, 3))
+
+    def _coverage_fraction(self, covered_area):
+        """
+        Fraction of the sampled ground cells covered, or 0 when none were sampled.
+
+        Every one of these divisions used to be written out longhand against
+        self.ground_area, which is zero whenever the DTM hull contains no
+        sample cell - a tiny or degenerate plot. That raised ZeroDivisionError,
+        in one case only at the very end of the measurement stage, after all
+        the work had been done.
+        """
+        if not self.ground_area:
+            return 0.0
+        return covered_area / self.ground_area
+
+    @property
+    def canopy_cover_fraction(self):
+        return self._coverage_fraction(self.canopy_area)
+
+    @property
+    def understory_veg_fraction(self):
+        return self._coverage_fraction(self.ground_veg_area)
+
+    @property
+    def cwd_fraction(self):
+        return self._coverage_fraction(self.cwd_area)
 
     def interpolate_cyl(self, cyl1, cyl2, resolution):
         """
@@ -840,16 +924,15 @@ class MeasureTree:
 
         def convert_character_cells_to_points(character):
             character = np.rot90(character, axes=(1, 0))
-            index_i = 0
-            index_j = 0
-            points = np.zeros((0, 3))
-            for i in character:
-                for j in i:
-                    if j == 1:
-                        points = np.vstack((points, np.array([[index_i, index_j, 0]])))
-                    index_j += 1
-                index_j = 0
-                index_i += 1
+            # np.argwhere returns the indices of the set cells in row-major
+            # order, which is exactly the order the nested loop visited them,
+            # so the resulting point cloud is unchanged. The loop it replaces
+            # walked every cell of the bitmap in Python and re-allocated the
+            # whole point array for each lit one - and this runs seven times
+            # per tree, once per line of the label.
+            lit = np.argwhere(character == 1)
+            points = np.zeros((lit.shape[0], 3))
+            points[:, :2] = lit
 
             roll_mat = np.array(
                 [[1, 0, 0], [0, np.cos(-np.pi / 4), -np.sin(-np.pi / 4)], [0, np.sin(-np.pi / 4), np.cos(-np.pi / 4)]]
@@ -1005,10 +1088,29 @@ class MeasureTree:
 
     @classmethod
     def cylinder_cleaning_multithreaded(cls, args):
-        def compute_frustum_volume(diameter_1, diameter_2, height):
-            radius_1 = 0.5 * diameter_1
-            radius_2 = 0.5 * diameter_2
-            volume = (1 / 3) * np.pi * height * (radius_1**2 + radius_1 + radius_2**2 + radius_2)
+        def compute_frustum_volume(radius_1, radius_2, height):
+            """
+            Volume of the conical frustum between two cylinders.
+
+            Two separate errors used to compound here, and tree_data's
+            "Volume_1" is the sum of one of these per cylinder of the tree:
+
+            1. The formula read "r1**2 + r1 + r2**2 + r2". A frustum is
+               (1/3) pi h (r1^2 + r1 r2 + r2^2); adding a length to an area is
+               dimensionally meaningless and there is no radius for which the
+               two agree. At r1 = 0.5 m, r2 = 0.3 m it overstated the segment
+               by 2.3x.
+            2. The parameters were named diameter_1/diameter_2 and halved on
+               entry, but the only caller - _stacked_frustum_volume - passes
+               cyl_dict["radius"], which is a radius (DBH is computed from it
+               as radius * 2). So every radius was halved a second time,
+               scaling the result by a further 1/4.
+
+            Volume_2, which is estimated from DBH and height rather than from
+            the cylinders, never went through this, which is why the two
+            volume columns disagreed so widely.
+            """
+            volume = (1 / 3) * np.pi * height * (radius_1**2 + radius_1 * radius_2 + radius_2**2)
             return volume
 
         """
@@ -1138,6 +1240,23 @@ class MeasureTree:
         return volume
 
     @staticmethod
+    def _rows_by_value(values):
+        """
+        Map each distinct entry of `values` to the row indices that hold it.
+
+        The indices for each value are ascending, so array[rows] gives the
+        same rows in the same order as array[values == value] would. Built
+        once with a stable sort, it replaces a full boolean scan of the array
+        per tree in the loops below - on a large plot those arrays are the
+        vegetation and stem point clouds, millions of rows, scanned once for
+        every tree.
+        """
+        order = np.argsort(values, kind="stable")
+        unique_values, starts = np.unique(values[order], return_index=True)
+        ends = np.append(starts[1:], values.shape[0])
+        return {value: order[start:end] for value, start, end in zip(unique_values, starts, ends)}
+
+    @staticmethod
     def inside_conv_hull(point, hull, tolerance=1e-5):
         """Checks if a point is inside a convex hull."""
         return all((np.dot(eq[:-1], point) + eq[-1] <= tolerance) for eq in hull.equations)
@@ -1240,7 +1359,7 @@ class MeasureTree:
         for name in thread_vars:
             os.environ[name] = "1"
         try:
-            cls._pool = get_context("spawn").Pool(processes=processes)
+            cls._pool = get_context("spawn").Pool(processes=processes, initializer=_initialise_worker)
             cls._pool_processes = processes
         finally:
             for name, value in saved.items():
@@ -1252,32 +1371,54 @@ class MeasureTree:
 
     @classmethod
     def close_pool(cls):
-        """Shuts the shared worker pool down. Safe to call when there isn't one."""
+        """
+        Shuts the shared worker pool down. Safe to call when there isn't one.
+
+        terminate() rather than close(): this is only called once every stage
+        has either collected all of its results or given up on them, so there
+        is never outstanding work to wait for. What close() + join() would wait
+        for is the pool's result cache to drain - and after a worker has died
+        with a task in hand (see pool_map_batched), the entry for that task
+        never drains, so join() blocked forever and the error the watchdog had
+        raised never reached the user. terminate() is what Pool.__exit__ does.
+        """
         if cls._pool is not None:
-            cls._pool.close()
+            cls._pool.terminate()
             cls._pool.join()
             cls._pool = None
             cls._pool_processes = None
 
     @classmethod
-    def pool_map_batched(cls, func, items, processes, label="", batch_size=None):
+    def pool_map_batched(cls, func, items, processes, label="", batch_size=None, costs=None):
         """
-        Run func over items in a spawn Pool, submitting work in bounded batches.
+        Run func over items in the shared spawn Pool with a bounded number of
+        tasks in flight, returning the results in input order.
 
-        multiprocessing.Pool.imap_unordered pickles the *entire* iterable into
-        the task pipe as fast as its feeder thread can manage, without waiting
-        for workers to drain it. Each task here carries numpy point arrays, so
-        a plot with thousands of stem clusters queues gigabytes of pending
-        overlapped writes and Windows eventually refuses:
+        multiprocessing.Pool.imap pickles the *entire* iterable into the task
+        pipe as fast as its feeder thread can manage, without waiting for the
+        workers to drain it. Each task here carries numpy point arrays, so a
+        plot with thousands of stem clusters queued gigabytes of pending
+        overlapped writes and Windows eventually refused:
 
             OSError: [WinError 1450] Insufficient system resources exist to
             complete the requested service
 
-        Submitting in batches keeps only batch_size tasks in flight, which
-        bounds both the pipe backlog and peak memory. Results come back in
-        input order: imap_unordered returned them in completion order, which
-        made the row order of every downstream array depend on worker
-        scheduling and so made repeat runs of the same plot disagree.
+        The first fix submitted fixed-size batches and waited for each batch
+        to finish before sending the next. That bounded the backlog but put a
+        barrier after every batch: the whole pool sat idle until the slowest
+        task in the batch - the main stem of a big tree, typically - was done.
+        On the example plot cylinder fitting used 32 s of worker CPU across 16
+        workers and still took 7.4 s of wall time.
+
+        Now the window slides. A semaphore lets the feeder run at most
+        batch_size tasks ahead of the results, and results are taken in
+        completion order and slotted back by index, so a long task never
+        holds up the submission of the ones behind it. `costs`, if given, is a
+        per-item estimate of work; items are submitted largest first so the
+        long tasks start at the front and the short ones fill in around them.
+        Every task's result depends only on its own input (the random fits
+        are seeded per cluster), so neither the submission order nor the
+        completion order changes any output - only how long it takes.
         """
         items = list(items)
         total = len(items)
@@ -1297,16 +1438,67 @@ class MeasureTree:
             # that the queued payload stays bounded.
             batch_size = max(processes * 8, 64)
 
+        if costs is not None:
+            submission_order = np.argsort(-np.asarray(costs, dtype=np.float64), kind="stable")
+        else:
+            submission_order = np.arange(total)
+
         pool = cls._get_pool(processes)
-        results = []
+        in_flight = threading.BoundedSemaphore(batch_size)
+        abandoned = threading.Event()
+
+        def gated_tasks():
+            # Runs on the pool's feeder thread. Blocks once batch_size tasks
+            # are outstanding; the timeout lets it notice a failure on the
+            # consumer side and stop, otherwise a raised exception below would
+            # leave this generator - and so the pool's task thread - blocked
+            # forever and close_pool() would never return.
+            for index in submission_order:
+                while not in_flight.acquire(timeout=0.1):
+                    if abandoned.is_set():
+                        return
+                if abandoned.is_set():
+                    return
+                yield int(index), func, items[index]
+
+        results = [None] * total
         done = 0
-        for start in range(0, total, batch_size):
-            batch = items[start : start + batch_size]
-            for result in pool.imap(func, batch):
-                results.append(result)
+        worker_pids = {process.pid for process in pool._pool}
+        try:
+            pending = pool.imap_unordered(_indexed_call, gated_tasks())
+            while done < total:
+                try:
+                    index, result = pending.next(timeout=15)
+                except StopIteration:
+                    break
+                except TimeoutError:
+                    # No result for a while. That is normal for a big stem
+                    # cluster, but it is also exactly what a lost task looks
+                    # like: when a worker is killed - the OS reclaiming
+                    # memory is the usual cause - Pool quietly starts a
+                    # replacement and never re-runs the task it was holding,
+                    # so imap waits for it forever. Then the GUI shows a run
+                    # that never finishes and no error anywhere. A replaced
+                    # worker shows up as a new pid in the pool, so fail with
+                    # a message instead of hanging.
+                    current_pids = {process.pid for process in pool._pool}
+                    if current_pids != worker_pids:
+                        lost = len(worker_pids - current_pids)
+                        raise RuntimeError(
+                            f"{lost} measurement worker process(es) died during {label or 'processing'} "
+                            "and their work was lost. This usually means the machine ran out of "
+                            "memory: close other applications, lower num_cpu_cores, or set "
+                            "prewarm_worker_pool=False in other_parameters.py and run again."
+                        )
+                    continue
+                in_flight.release()
+                results[index] = result
                 done += 1
                 if label and done % 10 == 0:
                     print("\r", done, "/", total, end="")
+        except BaseException:
+            abandoned.set()
+            raise
 
         if label:
             print("\r", total, "/", total, end="")
@@ -1393,6 +1585,10 @@ class MeasureTree:
             MeasureTree.close_pool()
 
     def _run_measurement_extraction(self):
+        import networkx as nx
+        import pandas as pd
+        from skspatial.objects import Plane
+
         skeleton_array = np.zeros((0, 3))
         cluster_array = np.zeros((0, 6))
         slice_heights = np.linspace(
@@ -1425,7 +1621,11 @@ class MeasureTree:
         # process pool the cylinder fitting uses. Results come back in input
         # order, so the stacked arrays are identical to the serial version's.
         slice_results = MeasureTree.pool_map_batched(
-            MeasureTree.threaded_slice_clustering, slice_inputs, self.num_cpu_cores, label="slice clustering"
+            MeasureTree.threaded_slice_clustering,
+            slice_inputs,
+            self.num_cpu_cores,
+            label="slice clustering",
+            costs=[points.shape[0] for points, _ in slice_inputs],
         )
         del slice_inputs
         if slice_results:
@@ -1438,22 +1638,22 @@ class MeasureTree:
             skeleton_array = cluster_dbscan(skeleton_array[:, :3], eps=self.slice_increment * 1.5)
         except ValueError:
             raise DataQualityError("Failed to cluster tree skeletons.")
-        skeleton_cluster_visualisation = np.zeros((0, 5))
-        for k in np.unique(
-            skeleton_array[:, -1]
-        ):  # Just assigns random colours to the clusters to make it easier to see different neighbouring groups.
-            skeleton_cluster_visualisation = np.vstack(
-                (
-                    skeleton_cluster_visualisation,
-                    np.hstack(
-                        (
-                            skeleton_array[skeleton_array[:, -1] == k],
-                            np.zeros((skeleton_array[skeleton_array[:, -1] == k].shape[0], 1))
-                            + np.random.randint(0, 10),
-                        )
-                    ),
-                )
-            )
+        # Just assigns random colours to the clusters to make it easier to see
+        # different neighbouring groups.
+        #
+        # Was a loop over every cluster label that scanned the whole skeleton
+        # array twice per label and re-stacked everything gathered so far -
+        # cubic-ish in practice on a big plot, for a debugging colour. One
+        # stable sort by label gives the same row order (labels ascending,
+        # original order within each) in a single pass.
+        skeleton_labels = skeleton_array[:, -1]
+        unique_labels, label_index = np.unique(skeleton_labels, return_inverse=True)
+        label_order = np.argsort(skeleton_labels, kind="stable")
+        cluster_colours = np.random.randint(0, 10, size=unique_labels.shape[0]).astype(np.float64)
+        skeleton_cluster_visualisation = np.hstack(
+            (skeleton_array[label_order], cluster_colours[label_index[label_order]][:, np.newaxis])
+        )
+        del skeleton_labels, unique_labels, label_index, label_order, cluster_colours
 
         print("Saving skeleton and cluster array...")
         save_file(
@@ -1464,17 +1664,49 @@ class MeasureTree:
 
         print("Making kdtree...")
         # Assign unassigned skeleton points to the nearest group.
-        unassigned_bool = skeleton_array[:, -1] == -1
-        kdtree = spatial.cKDTree(skeleton_array[unassigned_bool][:, :3], leafsize=100000)
-        distances, neighbours = kdtree.query(skeleton_array[unassigned_bool, :3], k=2)
-        skeleton_array[unassigned_bool, -1][distances[:, 1] < self.slice_increment * 3] = skeleton_array[
-            unassigned_bool, -1
-        ][neighbours[:, 1]][distances[:, 1] < self.slice_increment * 3]
+        #
+        # As written this did nothing whatsoever, in two separate ways:
+        #
+        #   1. "skeleton_array[unassigned_bool, -1][mask] = ..." chains two
+        #      fancy indexes. The first produces a copy, so the assignment
+        #      landed in a temporary that was discarded on the next line.
+        #   2. The tree was built from the unassigned points and queried with
+        #      the unassigned points, so the neighbour it found was always
+        #      another unassigned point, whose label is -1 by definition.
+        #      Even had the write landed, it would have written -1 over -1.
+        #
+        # DBSCAN's noise points therefore stayed at -1, and the cluster loop
+        # below starts at 0, so they were silently dropped from the plot.
+        #
+        # Doing what the comment describes - matching them against the
+        # *assigned* points - recovers skeleton points that are currently
+        # discarded, which changes which stems get cylinders fitted and so
+        # moves tree count, DBH and height. That is a real change in results,
+        # so it is opt-in, like fix_cci_sectors.
+        if self.parameters.get("assign_unassigned_skeleton_points", False):
+            unassigned_bool = skeleton_array[:, -1] == -1
+            assigned_bool = ~unassigned_bool
+            if np.any(unassigned_bool) and np.any(assigned_bool):
+                assigned_points = skeleton_array[assigned_bool]
+                kdtree = spatial.cKDTree(assigned_points[:, :3], leafsize=100000)
+                distances, neighbours = kdtree.query(skeleton_array[unassigned_bool, :3], k=1)
+                close_enough = distances < self.slice_increment * 3
+                # One write, straight into the column, via the index array -
+                # no intermediate copy to lose it in.
+                unassigned_idx = np.flatnonzero(unassigned_bool)[close_enough]
+                skeleton_array[unassigned_idx, -1] = assigned_points[neighbours[close_enough], -1]
+                print("    Reassigned", unassigned_idx.shape[0], "unassigned skeleton points.")
 
         input_data = []
         i = 0
         max_i = int(np.max(skeleton_array[:, -1]) + 1)
-        cl_kdtree = spatial.cKDTree(cluster_array[:, 3:], leafsize=100000)
+        # leafsize 16, not 100000. A leaf of 100,000 points makes the tree a
+        # single bucket, so the dual-tree query below degenerates into a
+        # brute-force comparison of every skeleton point against every stem
+        # point. Leaf size changes only how the same neighbour sets are
+        # found, not which points are in them; this cut the query from 3.7 s
+        # to 0.04 s on a 300k-point synthetic cloud.
+        cl_kdtree = spatial.cKDTree(cluster_array[:, 3:], leafsize=16)
         cluster_ids = range(0, max_i)
         print("Making initial branch/stem section clusters...")
 
@@ -1488,14 +1720,38 @@ class MeasureTree:
             "seed": self.parameters.get("random_seed", 0),
         }
 
-        # organised_clusters = np.zeros((0,5))
+        # Group the skeleton points by cluster label once, and match every
+        # skeleton point against the slice-cluster medians in one query.
+        #
+        # This used to scan the whole skeleton array with a boolean mask for
+        # each cluster id, then build a fresh cKDTree over that cluster and
+        # run query_ball_tree against the medians - O(clusters x skeleton
+        # points) for the scans and one tree build per cluster on top. A
+        # query_ball_tree result depends only on the individual source point
+        # and the target tree, so one call over all skeleton points gives
+        # exactly the per-point lists the per-cluster trees produced; grouping
+        # those by label reproduces each cluster's index set, and a stable
+        # sort keeps the skeleton rows in their original order within each.
+        skeleton_labels = skeleton_array[:, -1].astype(np.intp)
+        skeleton_kdtree = spatial.cKDTree(skeleton_array[:, :3], leafsize=16)
+        median_matches = skeleton_kdtree.query_ball_tree(cl_kdtree, r=0.0001)
+        label_order = np.argsort(skeleton_labels, kind="stable")
+        # Start offset of each label 0..max_i-1 within label_order. Label -1
+        # (unassigned) sorts first and is skipped, exactly as before.
+        label_bounds = np.searchsorted(skeleton_labels[label_order], np.arange(max_i + 1))
+        del skeleton_kdtree
+
         for cluster_id in cluster_ids:
             if i % 100 == 0:
                 print("\r", i, "/", max_i, end="")
             i += 1
-            skel_cluster = skeleton_array[skeleton_array[:, -1] == cluster_id, :3]
-            sc_kdtree = spatial.cKDTree(skel_cluster, leafsize=100000)
-            results = np.unique(np.hstack(sc_kdtree.query_ball_tree(cl_kdtree, r=0.0001)))
+            skeleton_rows = label_order[label_bounds[cluster_id] : label_bounds[cluster_id + 1]]
+            skel_cluster = skeleton_array[skeleton_rows, :3]
+            # An integer index even when every list is empty; the float array
+            # np.hstack returns for that case is not a valid index.
+            results = np.unique(
+                np.hstack([median_matches[row] for row in skeleton_rows] or [[]]).astype(np.intp)
+            )
             cluster_array_clean = cluster_array[results, :3]
             input_data.append(
                 [
@@ -1513,7 +1769,13 @@ class MeasureTree:
 
         print("Starting multithreaded cylinder fitting... This can take a while.")
         outputlist = MeasureTree.pool_map_batched(
-            MeasureTree.threaded_cyl_fitting, input_data, self.num_cpu_cores, label="cyl fitting"
+            MeasureTree.threaded_cyl_fitting,
+            input_data,
+            self.num_cpu_cores,
+            label="cyl fitting",
+            # One circle fit per skeleton point, each linear in the points
+            # of its slice: skeleton size x point count tracks the cost.
+            costs=[task[0].shape[0] * task[1].shape[0] for task in input_data],
         )
         # Free the task payloads before stacking - input_data holds a copy of
         # the stem points for every cluster.
@@ -1565,13 +1827,11 @@ class MeasureTree:
                     tree_kdtree.query_ball_point(highest_point[:3], r=max_search_radius)
                 ]
 
-                lowest_point_z = lowest_point[2] - griddata(
-                    (self.DTM[:, 0], self.DTM[:, 1]),
-                    self.DTM[:, 2],
-                    lowest_point[0:2],
-                    method="linear",
-                    fill_value=np.median(self.DTM[:, 2]),
-                )
+                # Same interpolation as before, through the DTM triangulation
+                # built once in __init__. This is one point per tree, so the
+                # old griddata call spent all its time rebuilding the
+                # triangulation and none of it interpolating.
+                lowest_point_z = lowest_point[2] - self.dtm_interpolator(lowest_point[0:2])
                 assigned = False
                 if lowneighbours.shape[0] > 0:
                     angles = MeasureTree.compute_angle(lowest_point[3:6], lowest_point[:3] - lowneighbours[:, :3])
@@ -1623,14 +1883,20 @@ class MeasureTree:
         print("Cylinder interpolation...")
 
         tree_list = []
-        interpolated_full_cyl_array = np.zeros((0, 14))
+        # Appended to from three nesting levels below and never read
+        # until the loop is done, so collect the pieces and stack once.
+        # Re-stacking the whole array for every interpolated segment of
+        # every branch of every tree was quadratic in the cylinder count.
+        interpolated_parts = []
         max_tree_id = np.unique(sorted_full_cyl_array[:, self.cyl_dict["tree_id"]]).shape[0]
         for tree_id in np.unique(sorted_full_cyl_array[:, self.cyl_dict["tree_id"]]):
             if int(tree_id) % 10 == 0:
                 print("Tree ID", int(tree_id), "/", int(max_tree_id))
             current_tree = sorted_full_cyl_array[sorted_full_cyl_array[:, self.cyl_dict["tree_id"]] == tree_id]
             if current_tree.shape[0] >= self.parameters["min_tree_cyls"]:
-                interpolated_full_cyl_array = np.vstack((interpolated_full_cyl_array, current_tree))
+                # Copied because get_heights_above_DTM below writes into
+                # current_tree in place; the old vstack took its copy here.
+                interpolated_parts.append(current_tree.copy())
                 _, individual_branches_indices = np.unique(
                     current_tree[:, self.cyl_dict["branch_id"]], return_index=True
                 )
@@ -1660,13 +1926,21 @@ class MeasureTree:
                                         interp_to_point, lowest_point, resolution=self.slice_increment
                                     )
                                     current_branch = np.vstack((current_branch, interpolated_cyls))
-                                    interpolated_full_cyl_array = np.vstack(
-                                        (interpolated_full_cyl_array, interpolated_cyls)
-                                    )
+                                    interpolated_parts.append(interpolated_cyls)
 
                     if parent_branch.shape[0] > 0:
-                        parent_centre = np.mean(parent_branch[:, :3])
-                        closest_point_index = np.argmin(np.linalg.norm(parent_centre - current_branch[:, :3]))
+                        # Both reductions were missing their axis. np.mean over
+                        # the (n, 3) block returns one number averaged across x,
+                        # y and z together rather than the branch centroid, and
+                        # np.linalg.norm of the result is likewise a single
+                        # number rather than one distance per cylinder - so
+                        # argmin was always 0 and "the closest point of the
+                        # current branch" was just its first row, whatever that
+                        # happened to be.
+                        parent_centre = np.mean(parent_branch[:, :3], axis=0)
+                        closest_point_index = np.argmin(
+                            np.linalg.norm(parent_centre - current_branch[:, :3], axis=1)
+                        )
                         closest_point_of_current_branch = current_branch[closest_point_index]
                         kdtree = spatial.cKDTree(parent_branch[:, :3])
                         parent_points_in_range = parent_branch[
@@ -1678,22 +1952,29 @@ class MeasureTree:
                                 lowest_point_of_current_branch[3:6],
                                 lowest_point_of_current_branch[:3] - parent_points_in_range[:, :3],
                             )
-                            angles = angles[angles <= max_search_angle]
+                            # Keep the mask rather than overwriting `angles`
+                            # with the filtered copy. The filtered array is
+                            # shorter, so np.argmin(angles) indexed a different
+                            # row of parent_points_in_range than the one that
+                            # actually had the smallest angle - silently
+                            # interpolating the branch to the wrong parent
+                            # cylinder. The equivalent block in "Correcting
+                            # Cylinder assignments" above keeps the unfiltered
+                            # array and does this correctly.
+                            within_search_angle = angles <= max_search_angle
 
-                            if angles.shape[0] > 0:
-                                best_parent_point = parent_points_in_range[np.argmin(angles)]
+                            if np.any(within_search_angle):
+                                candidates = parent_points_in_range[within_search_angle]
+                                best_parent_point = candidates[np.argmin(angles[within_search_angle])]
                                 # Interpolates from lowest point of current branch to smallest angle parent point.
-                                interpolated_full_cyl_array = np.vstack(
-                                    (
-                                        interpolated_full_cyl_array,
-                                        self.interpolate_cyl(
-                                            lowest_point_of_current_branch,
-                                            best_parent_point,
-                                            resolution=self.slice_increment,
-                                        ),
+                                interpolated_parts.append(
+                                    self.interpolate_cyl(
+                                        lowest_point_of_current_branch,
+                                        best_parent_point,
+                                        resolution=self.slice_increment,
                                     )
                                 )
-                current_tree = get_heights_above_DTM(current_tree, self.DTM)
+                current_tree = get_heights_above_DTM(current_tree, self.DTM, self.dtm_interpolator)
                 lowest_10_measured_tree_points = deepcopy(current_tree[np.argsort(current_tree[:, -1])][:10])
                 lowest_measured_tree_point = np.median(lowest_10_measured_tree_points, axis=0)
                 tree_base_point = deepcopy(current_tree[np.argmin(current_tree[:, self.cyl_dict["height_above_dtm"]])])
@@ -1702,7 +1983,10 @@ class MeasureTree:
                 interpolated_to_ground = self.interpolate_cyl(
                     lowest_measured_tree_point, tree_base_point, resolution=self.slice_increment
                 )
-                interpolated_full_cyl_array = np.vstack((interpolated_full_cyl_array, interpolated_to_ground))
+                interpolated_parts.append(interpolated_to_ground)
+
+        interpolated_full_cyl_array = np.vstack([np.zeros((0, 14))] + interpolated_parts)
+        del interpolated_parts
 
         v1 = interpolated_full_cyl_array[:, 3:6]
         v2 = np.vstack(
@@ -1713,7 +1997,9 @@ class MeasureTree:
             )
         ).T
         interpolated_full_cyl_array[:, self.cyl_dict["segment_angle_to_horiz"]] = self.compute_angle(v1, v2)
-        interpolated_full_cyl_array = get_heights_above_DTM(interpolated_full_cyl_array, self.DTM)
+        interpolated_full_cyl_array = get_heights_above_DTM(
+            interpolated_full_cyl_array, self.DTM, self.dtm_interpolator
+        )
 
         save_file(
             self.output_dir + "interpolated_full_cyl_array.las",
@@ -1761,13 +2047,14 @@ class MeasureTree:
 
         if tree_id_list.shape[0] > 0:
             max_tree_id = int(np.max(tree_id_list))
+            interpolated_rows_by_tree = self._rows_by_value(
+                interpolated_full_cyl_array[:, self.cyl_dict["tree_id"]]
+            )
             for tree_id in tree_id_list:
                 if tree_id % 10 == 0:
                     print("\r", tree_id, "/", max_tree_id, end="")
                 i += 1
-                single_tree = interpolated_full_cyl_array[
-                    interpolated_full_cyl_array[:, self.cyl_dict["tree_id"]] == tree_id
-                ]
+                single_tree = interpolated_full_cyl_array[interpolated_rows_by_tree[tree_id]]
                 if single_tree.shape[0] > 0:
                     # single_tree = self.fix_outliers(single_tree)
                     input_data.append([single_tree, self.parameters["cleaned_measurement_radius"], self.cyl_dict])
@@ -1777,7 +2064,11 @@ class MeasureTree:
 
             print("Starting multithreaded cylinder cleaning/smoothing...")
             cleaned_cyls_list = MeasureTree.pool_map_batched(
-                MeasureTree.cylinder_cleaning_multithreaded, input_data, self.num_cpu_cores, label="cyl cleaning"
+                MeasureTree.cylinder_cleaning_multithreaded,
+                input_data,
+                self.num_cpu_cores,
+                label="cyl cleaning",
+                costs=[task[0].shape[0] for task in input_data],
             )
             del input_data
             cleaned_cyls = np.vstack(cleaned_cyls_list)
@@ -1789,29 +2080,46 @@ class MeasureTree:
             )
 
             cleaned_cylinders = np.zeros((0, cleaned_cyls.shape[1]))
+            # Per-tree pieces, stacked once after the loop (see below).
+            tree_data_parts = []
+            taper_parts = []
+            stem_points_sorted_parts = []
+            veg_points_sorted_parts = []
+            cleaned_cylinders_parts = []
+            text_point_cloud_parts = []
 
             print("Sorting vegetation...")
             # Simple nearest neighbours vegetation sorting.
             kdtree = spatial.cKDTree(cleaned_cyls[:, :2], leafsize=1000)
-            results = kdtree.query(self.vegetation_points[:, :2], k=1)
+            # workers=-1: each query point is answered independently, so
+            # spreading millions of them across the cores changes nothing but
+            # the time (3.5 s single-threaded on a 5M point plot).
+            results = kdtree.query(self.vegetation_points[:, :2], k=1, workers=-1)
             mask = results[0] <= self.parameters["veg_sorting_range"]
             self.vegetation_points = self.vegetation_points[mask]
             results = results[1][mask]
             self.vegetation_points[:, self.veg_dict["tree_id"]] = cleaned_cyls[results, self.cyl_dict["tree_id"]]
 
             kdtree = spatial.cKDTree(cleaned_cyls[:, :2], leafsize=1000)
-            results = kdtree.query(self.stem_points[:, :2], k=1)
+            results = kdtree.query(self.stem_points[:, :2], k=1, workers=-1)
             mask = results[0] <= self.parameters["veg_sorting_range"]
             self.stem_points = self.stem_points[mask]
             results = results[1][mask]
             self.stem_points[:, self.stem_dict["tree_id"]] = cleaned_cyls[results, self.cyl_dict["tree_id"]]
 
+            # Row groups per tree id, each built once (see _rows_by_value).
+            cyl_rows_by_tree = self._rows_by_value(cleaned_cyls[:, self.cyl_dict["tree_id"]])
+            veg_rows_by_tree = self._rows_by_value(self.vegetation_points[:, self.veg_dict["tree_id"]])
+            stem_rows_by_tree = self._rows_by_value(self.stem_points[:, self.stem_dict["tree_id"]])
+            no_rows = np.zeros(0, dtype=np.intp)
+
             for tree_id in np.unique(cleaned_cyls[:, self.cyl_dict["tree_id"]]):
-                tree = cleaned_cyls[cleaned_cyls[:, self.cyl_dict["tree_id"]] == tree_id]
-                tree_vegetation = self.vegetation_points[self.vegetation_points[:, self.veg_dict["tree_id"]] == tree_id]
+                tree = cleaned_cyls[cyl_rows_by_tree[tree_id]]
+                tree_vegetation = self.vegetation_points[veg_rows_by_tree.get(tree_id, no_rows)]
+                tree_stem_points = self.stem_points[stem_rows_by_tree.get(tree_id, no_rows)]
                 combined = np.vstack((tree[:, :3], tree_vegetation[:, :3]))
                 combined = np.hstack((combined, np.zeros((combined.shape[0], 1))))
-                combined = get_heights_above_DTM(combined, self.DTM)
+                combined = get_heights_above_DTM(combined, self.DTM, self.dtm_interpolator)
 
                 # Get highest point of tree. Note, there is usually noise, so we use the 98th percentile.
                 tree_max_point = combined[
@@ -1833,7 +2141,7 @@ class MeasureTree:
                 del combined
 
                 if self.parameters["sort_stems"] or self.parameters["generate_output_point_cloud"]:
-                    tree_points = self.stem_points[self.stem_points[:, self.stem_dict["tree_id"]] == tree_id]
+                    tree_points = tree_stem_points
 
                 DBH_cyls_slice = tree[
                     np.logical_and(
@@ -1842,10 +2150,19 @@ class MeasureTree:
                     )
                 ]
 
-                DBH_points_slice = self.stem_points[
+                # Breast-height slice of *this tree's* stem points. The height
+                # filter used to be applied to self.stem_points, the whole
+                # plot, so every tree's CCI at breast height was measured
+                # against a slice containing every other tree's stem returns
+                # too. Any neighbouring stem that happened to fall in the
+                # 0.8-1.2 r annulus around this tree's centre was counted as
+                # coverage of this tree's circumference, inflating the number.
+                # CCI_at_BH is reported in tree_data.csv; nothing downstream
+                # filters on it, so this corrects that column alone.
+                DBH_points_slice = tree_stem_points[
                     np.logical_and(
-                        self.stem_points[:, self.stem_dict["height_above_dtm"]] >= 1.2,
-                        self.stem_points[:, self.stem_dict["height_above_dtm"]] <= 1.4,
+                        tree_stem_points[:, self.stem_dict["height_above_dtm"]] >= 1.2,
+                        tree_stem_points[:, self.stem_dict["height_above_dtm"]] <= 1.4,
                     )
                 ]
 
@@ -1992,52 +2309,56 @@ class MeasureTree:
                             self.plot_summary["PlotId"].item(),
                         )
 
+                        # Both branches below did the same work; only the
+                        # keep/drop test differed, so it is now written once.
+                        #
+                        # Every one of these used to be
+                        # "arr = np.vstack((arr, new_rows))" per tree, which
+                        # reallocates the whole accumulated array and copies it
+                        # again for each tree in the plot - quadratic in the
+                        # tree count, and stem_points_sorted and
+                        # veg_points_sorted accumulate entire point clouds, not
+                        # just a row. Collecting the pieces and stacking once
+                        # after the loop produces byte-identical arrays.
+                        keep_tree = True
                         if radial_tree_aware_plot_cropping:
-                            if (
+                            keep_tree = (
                                 np.linalg.norm(np.array([x_tree_base, y_tree_base]) - np.array(plot_centre))
                                 < self.parameters["plot_radius"]
-                            ):
-                                tree_data = np.vstack((tree_data, this_trees_data))
-                                if self.parameters["sort_stems"] or self.parameters["generate_output_point_cloud"]:
-                                    stem_points_sorted = np.vstack(
-                                        (stem_points_sorted, tree_points)
-                                    )  # TODO make this separate loop as it will be faster.
-                                veg_points_sorted = np.vstack((veg_points_sorted, tree_vegetation))
-                                cleaned_cylinders = np.vstack((cleaned_cylinders, tree))
-                                self.text_point_cloud = np.vstack(
-                                    (
-                                        self.text_point_cloud,
-                                        tree_id,
-                                        line0,
-                                        line1,
-                                        line2,
-                                        line3,
-                                        line4,
-                                        height_measurement_line,
-                                        dbh_circle_points,
-                                    )
-                                )
-                                taper_array = np.vstack((taper_array, taper))
+                            )
 
-                        else:
-                            tree_data = np.vstack((tree_data, this_trees_data))
-                            taper_array = np.vstack((taper_array, taper))
+                        if keep_tree:
+                            tree_data_parts.append(this_trees_data)
+                            taper_parts.append(taper)
                             if self.parameters["sort_stems"] or self.parameters["generate_output_point_cloud"]:
-                                stem_points_sorted = np.vstack((stem_points_sorted, tree_points))
-                            veg_points_sorted = np.vstack((veg_points_sorted, tree_vegetation))
-                            cleaned_cylinders = np.vstack((cleaned_cylinders, tree))
-                            self.text_point_cloud = np.vstack(
+                                stem_points_sorted_parts.append(tree_points)
+                            veg_points_sorted_parts.append(tree_vegetation)
+                            cleaned_cylinders_parts.append(tree)
+                            text_point_cloud_parts.extend(
                                 (
-                                    self.text_point_cloud,
                                     tree_id,
                                     line0,
                                     line1,
                                     line2,
                                     line3,
+                                    # line4 (the "VOLUME 2" line) is built for
+                                    # every tree and was stacked in the
+                                    # tree-aware-cropping branch but was missing
+                                    # from the uncropped one, so in the default
+                                    # mode the annotation cloud silently lost
+                                    # that line for every tree.
+                                    line4,
                                     height_measurement_line,
                                     dbh_circle_points,
                                 )
                             )
+
+            tree_data = np.vstack([tree_data] + tree_data_parts)
+            taper_array = np.vstack([taper_array] + taper_parts)
+            stem_points_sorted = np.vstack([stem_points_sorted] + stem_points_sorted_parts)
+            veg_points_sorted = np.vstack([veg_points_sorted] + veg_points_sorted_parts)
+            cleaned_cylinders = np.vstack([cleaned_cylinders] + cleaned_cylinders_parts)
+            self.text_point_cloud = np.vstack([self.text_point_cloud] + text_point_cloud_parts)
 
             save_file(self.output_dir + "text_point_cloud.las", self.text_point_cloud)
             if self.parameters["sort_stems"] or self.parameters["generate_output_point_cloud"]:
@@ -2123,7 +2444,11 @@ class MeasureTree:
         )
 
         self.plot_summary["Num Trees in Plot"] = tree_data.shape[0]
-        self.plot_summary["Stems/ha"] = np.around(tree_data.shape[0] / self.plot_area, 1)
+        # A plot whose DTM convex hull has zero area gives plot_area == 0;
+        # dividing by it raised ZeroDivisionError right at the end of the run.
+        self.plot_summary["Stems/ha"] = (
+            np.around(tree_data.shape[0] / self.plot_area, 1) if self.plot_area else 0.0
+        )
 
         if tree_data.shape[0] > 0:
             self.plot_summary["Mean DBH"] = np.mean(tree_data["DBH"])
@@ -2148,7 +2473,7 @@ class MeasureTree:
             self.plot_summary["Max Volume 2"] = np.max(tree_data["Volume_2"])
             self.plot_summary["Total Volume 2"] = np.sum(tree_data["Volume_2"])
 
-            self.plot_summary["Canopy Cover Fraction"] = self.canopy_area / self.ground_area
+            self.plot_summary["Canopy Cover Fraction"] = self.canopy_cover_fraction
 
         else:
             self.plot_summary["Mean DBH"] = 0
@@ -2171,8 +2496,8 @@ class MeasureTree:
         self.plot_summary["Avg Gradient X"] = avg_gradient_x
         self.plot_summary["Avg Gradient Y"] = avg_gradient_y
 
-        self.plot_summary["Understory Veg Coverage Fraction"] = float(self.ground_veg_area) / float(self.ground_area)
-        self.plot_summary["CWD Coverage Fraction"] = float(self.cwd_area) / float(self.ground_area)
+        self.plot_summary["Understory Veg Coverage Fraction"] = self.understory_veg_fraction
+        self.plot_summary["CWD Coverage Fraction"] = self.cwd_fraction
 
         self.plot_summary.to_csv(self.output_dir + "plot_summary.csv", index=False)
         print("Measuring plot took", self.measure_total_time, "s")

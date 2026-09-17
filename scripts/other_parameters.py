@@ -10,6 +10,10 @@ other_parameters = dict(
     # for comparison, the unseeded randomness below used to move ~8.76% between runs. Ignored on CPU.
     # Caveat: fp16 reductions are not bit-deterministic, so even with random_seed set two runs can differ
     # on a handful of points (measured: 2 in 673,517). Set use_amp=False for exactly repeatable output.
+    prewarm_worker_pool=True,  # Start the measurement stage's worker processes while the GPU is busy with
+    # segmentation, so their start-up (importing numpy/scipy/sklearn/hdbscan, several seconds per worker on
+    # Windows) is hidden behind it rather than paid at the start of measurement. Costs roughly 100 MB of RAM
+    # per idle worker during segmentation; set to False on a memory-starved machine.
     random_seed=0,  # Makes runs reproducible. Two things in FSCT are random: the subsampling of boxes that
     # exceed max_points_per_box, and the random starting point of the farthest-point-sampling in the
     # segmentation model. Left unseeded they made repeat runs on the same file disagree on roughly 10% of
@@ -43,6 +47,12 @@ other_parameters = dict(
     # "evenly spaced sectors" are really 80 arbitrary directions. Setting this to True uses genuinely evenly
     # spaced sectors. It changes CCI values, and CCI decides which cylinders survive, so stem count, DBH and tree
     # height all move with it. Left off by default so results stay comparable with earlier runs.
+    assign_unassigned_skeleton_points=False,  # The step that was meant to fold DBSCAN's leftover "noise"
+    # skeleton points into their nearest cluster never did anything (it wrote into a temporary copy, and
+    # looked for neighbours only among the other unassigned points). Those points are currently dropped.
+    # Setting this to True makes the step work as described. It recovers skeleton points, which changes
+    # which stems get cylinders fitted and moves stem count, DBH and height with it - so it is off by
+    # default and results stay comparable with earlier runs.
     circle_fit_trials=1000,  # Maximum RANSAC trials per fitted circle. The original code used 10,000 with a
     # sample size of 30% of the slice, a combination for which RANSAC's early-stopping rule almost never
     # fires, so nearly every circle ran all 10,000 trials. The trials are now evaluated in batches and the

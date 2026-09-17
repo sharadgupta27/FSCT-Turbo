@@ -262,7 +262,12 @@ This mode is used when plot_radius and plot_radius_buffer are both non-zero.
 Advanced knobs live in `scripts/other_parameters.py`, including the two that
 control cylinder fitting cost (`circle_fit_trials`, `circle_fit_max_points`) and
 `fix_cci_sectors`, which corrects a units bug in the CCI sector calculation. It
-is off by default because turning it on shifts every downstream number.
+is off by default because turning it on shifts every downstream number. Two
+more of the same kind: `assign_unassigned_skeleton_points` (off) enables a
+skeleton-point recovery step that never worked in upstream FSCT, and
+`prewarm_worker_pool` (on) starts the measurement workers during GPU
+segmentation when there is enough free memory — turn it off on a machine that
+is short of RAM.
 
 ## Reproducibility
 
