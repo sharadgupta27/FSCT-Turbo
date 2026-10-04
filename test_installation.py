@@ -1,9 +1,9 @@
 """
 FSCT installation test.
 
-Run this to verify the environment is complete. FSCT.bat runs it
+Run this to verify the environment is complete. FSCT-Turbo.bat runs it
 automatically as the final step of setup, and on demand via
-"FSCT.bat verify".
+"FSCT-Turbo.bat verify".
 
     python test_installation.py
 """
@@ -147,7 +147,7 @@ def test_cuda():
         if has_gpu:
             return False, (
                 "An Nvidia GPU is present but a CPU-only build of PyTorch is installed. "
-                "Re-run FSCT.bat setup /force to rebuild the environment."
+                "Re-run FSCT-Turbo.bat setup /force to rebuild the environment."
             )
         return True, "CPU-only build, no Nvidia GPU detected (fine, just slower)"
 
@@ -177,7 +177,7 @@ def main():
     required_passed &= passed
 
     print("\n[2] Deep learning stack")
-    # torchvision is intentionally absent - see the note in FSCT.bat.
+    # torchvision is intentionally absent - see the note in FSCT-Turbo.bat.
     for module, name in [
         ("torch", "PyTorch"),
         ("torch_geometric", "PyTorch Geometric"),
@@ -232,6 +232,7 @@ def main():
         "scripts/measure.py",
         "model/model.pth",
         "version.py",
+        "fsct_job.py",  # both interfaces run the pipeline through it
     ])
     print_result("Core files", passed, message)
     required_passed &= passed
@@ -260,10 +261,10 @@ def main():
     print_header("Summary")
     if required_passed:
         print("\n  All required checks passed.\n")
-        print("  Start FSCT with:  FSCT.bat gui")
+        print("  Start FSCT with:  FSCT-Turbo.bat gui")
     else:
         print("\n  Some required checks FAILED.\n")
-        print("  Run 'FSCT.bat install /force' to rebuild the environment.")
+        print("  Run 'FSCT-Turbo.bat install /force' to rebuild the environment.")
     print("\n" + "=" * 60 + "\n")
 
     return 0 if required_passed else 1

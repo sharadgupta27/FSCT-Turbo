@@ -12,7 +12,8 @@ Threading: every long operation runs on a daemon worker. Tk is not thread
 safe, so workers never touch a widget. They push text onto plain deques and a
 single repeating timer on the main loop drains them (see _pump_output). The
 few one-shot callbacks that do need the main thread go through
-_on_main_thread.
+_on_main_thread. The FSCT pipeline itself runs in a child process
+(fsct_job.py), so Stop can end it.
 """
 
 import tkinter as tk
@@ -37,7 +38,7 @@ except ImportError:  # pragma: no cover - environment problem, not a code path
     messagebox.showerror(
         "CustomTkinter is missing",
         "The FSCT desktop app needs the 'customtkinter' package.\n\n"
-        "Run  FSCT.bat setup  to repair the environment, or install it with:\n"
+        "Run  FSCT-Turbo.bat setup  to repair the environment, or install it with:\n"
         "    pip install customtkinter",
     )
     sys.exit(1)
@@ -52,6 +53,7 @@ for _path in (os.path.join(PROJECT_ROOT, 'scripts'), PROJECT_ROOT):
         sys.path.insert(0, _path)
 
 from version import __version__
+import fsct_job
 
 _fsct_lock = threading.Lock()
 _fsct_modules = None
@@ -125,25 +127,6 @@ FONT_SMALL = ("Segoe UI", 11)
 FONT_TINY = ("Segoe UI", 10)
 FONT_STAT = ("Segoe UI", 18, "bold")
 FONT_MONO = ("Consolas", 11)
-
-# Substrings that identify which stage of the pipeline is running, so the
-# Analysis page can show progress instead of an anonymous spinner. Matched in
-# order against each console line, first hit wins.
-STAGE_MARKERS = (
-    ("Pre-processing point cloud", "Preprocessing"),
-    ("Performing inference", "Semantic segmentation"),
-    ("Semantic segmentation done", "Post-processing"),
-    ("Loading segmented point cloud", "Post-processing"),
-    ("Making DTM", "Building DTM"),
-    ("Post processing done", "Measuring plot"),
-    ("Making and clustering slices", "Measuring: slices"),
-    ("cylinder fitting", "Measuring: cylinder fitting"),
-    ("Sorting Cylinders", "Measuring: sorting stems"),
-    ("Cylinder interpolation", "Measuring: interpolation"),
-    ("Sorting vegetation", "Measuring: vegetation"),
-    ("Measuring plot done", "Writing report"),
-)
-
 
 def shade(pair):
     """Resolve a (light, dark) pair against the current appearance mode."""
@@ -420,62 +403,6 @@ def laszip_vlr_mismatch(path):
 
 
 # ---------------------------------------------------------------------------
-# stdout/stderr capture
-# ---------------------------------------------------------------------------
-class ConsoleStream:
-    """
-    Splits a text stream into lines for the in-app processing console.
-
-    FSCT reports progress with print("\\r", i, "/", n, end=""), so naive
-    line-per-write logging produced tens of thousands of near-identical lines
-    and made the window crawl. Text after a carriage return is flagged
-    transient, and the console replaces the previous transient line instead of
-    appending to it.
-
-    `original`, if given, also receives everything - but the app passes None.
-    Mirroring to the launching terminal duplicates the whole run in two places
-    and the GUI console is the one being read; use "Save log..." to keep a
-    copy. Note this only redirects the parent process: scripts/measure.py and
-    scripts/tools.py fan work out to spawned worker processes that hold their
-    own console handle, so anything *they* print still lands in the terminal
-    and cannot be intercepted from here.
-    """
-
-    def __init__(self, sink, original=None):
-        self._sink = sink
-        self._original = original
-        self._buffer = ""
-
-    def write(self, text):
-        if self._original is not None:
-            try:
-                self._original.write(text)
-            except Exception:
-                pass
-
-        self._buffer += text
-        while True:
-            newline = self._buffer.find("\n")
-            carriage = self._buffer.find("\r")
-            if newline == -1 and carriage == -1:
-                break
-            if newline != -1 and (carriage == -1 or newline < carriage):
-                line, self._buffer = self._buffer[:newline], self._buffer[newline + 1:]
-                self._sink(line.rstrip(), False)
-            else:
-                line, self._buffer = self._buffer[:carriage], self._buffer[carriage + 1:]
-                if line.strip():
-                    self._sink(line.rstrip(), True)
-
-    def flush(self):
-        if self._original is not None:
-            try:
-                self._original.flush()
-            except Exception:
-                pass
-
-
-# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 class FSCTStandaloneApp:
@@ -500,6 +427,10 @@ class FSCTStandaloneApp:
         self.processing = False
         self.threads = []
         self._start_time = None
+        # The running fsct_job child process, and whether Stop asked for it
+        # to die (so its non-zero exit is reported as stopped, not failed).
+        self._job = None
+        self._stop_requested = False
 
         # Workers append here; _pump_output drains them on the main loop.
         self._console_queue = collections.deque()
@@ -631,7 +562,7 @@ class FSCTStandaloneApp:
             if not messagebox.askokcancel(
                 "Quit",
                 "An analysis is still running.\n\n"
-                "Quitting now leaves a partial output folder behind. Quit anyway?",
+                "Quitting stops it and leaves a partial output folder behind. Quit anyway?",
             ):
                 return
             self.processing = False
@@ -642,13 +573,19 @@ class FSCTStandaloneApp:
             self.save_config()
         except Exception:
             pass
+        # The run is a separate process tree; exiting the app would not end it.
+        try:
+            self._stop_requested = True
+            fsct_job.stop(self._job)
+        except Exception:
+            pass
         try:
             self.root.quit()
             self.root.destroy()
         except Exception:
             pass
-        # Worker threads are daemons, but FSCT's own thread pools are not
-        # always, so exit hard rather than hang on a half-finished run.
+        # Worker threads are daemons; exit hard rather than wait on one that
+        # is still reading the stopped job's pipe.
         os._exit(0)
 
     # -- layout -------------------------------------------------------------
@@ -1186,7 +1123,7 @@ class FSCTStandaloneApp:
 
         lastools = Card(
             page, title="LAStools",
-            description="Optional. FSCT.bat downloads it automatically; it only "
+            description="Optional. FSCT-Turbo.bat downloads it automatically; it only "
                         "powers the external 3D viewer, everything else uses laspy.",
         )
         lastools.grid(row=0, column=0, sticky="ew")
@@ -1314,9 +1251,10 @@ class FSCTStandaloneApp:
 
         Segmentation memory scales with the batch, and exceeding VRAM is far
         worse than a small batch: measured on a 4 GB RTX 3050, fp32 batch 2
-        took 17 s, batch 4 took 25 s and batch 6 took 54 s, because the driver
-        was paging activations to host memory. Mixed precision roughly halves
-        the requirement, which is why the thresholds below are generous.
+        took 17 s (1.37 GB peak), batch 4 took 25 s (2.42 GB) and batch 6 took
+        54 s (3.28 GB), because the driver was paging activations to host
+        memory. The thresholds assume fp32, the default. The batch size changes
+        only the speed, never the labels.
         """
         try:
             import torch
@@ -1331,8 +1269,10 @@ class FSCTStandaloneApp:
             batch = 8
         elif total_gb >= 10:
             batch = 6
+        elif total_gb >= 6:
+            batch = 4  # 2.4 GB in fp32
         else:
-            batch = 4  # ~1.6 GB in mixed precision, comfortable on a 4 GB card
+            batch = 2  # 1.4 GB in fp32; batch 4 was slower on a 4 GB card
 
         return batch, (
             f"{name} ({total_gb:.1f} GB) - suggested {batch}. Raising this past "
@@ -1606,7 +1546,7 @@ class FSCTStandaloneApp:
                     error_msg = (
                         "LAZ compression is not available. Install the lazrs package:\n\n"
                         "    pip install lazrs\n\n"
-                        "Or run FSCT.bat setup /force to rebuild the environment."
+                        "Or run FSCT-Turbo.bat setup /force to rebuild the environment."
                     )
                 self.log_operation(f"Error: {error_msg}")
                 self._on_main_thread(
@@ -1896,7 +1836,7 @@ class FSCTStandaloneApp:
                 "FSCT modules unavailable",
                 "The FSCT modules could not be imported:\n\n"
                 f"{self.fsct_error}\n\n"
-                "Re-run FSCT.bat setup /force to rebuild the environment.",
+                "Re-run FSCT-Turbo.bat setup /force to rebuild the environment.",
             )
             return
 
@@ -1931,101 +1871,92 @@ class FSCTStandaloneApp:
         self.console_log(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.console_log("")
 
-        parameters = {
-            'point_cloud_filename': file_path,
-            'plot_centre': None,
-            'plot_radius': self.plot_radius.get(),
-            'plot_radius_buffer': self.plot_buffer.get(),
-            'batch_size': self.batch_size.get(),
-            'num_cpu_cores': self.num_cores.get() if self.num_cores.get() > 0 else os.cpu_count(),
-            'use_CPU_only': self.use_cpu.get(),
-            'slice_thickness': self.slice_thickness.get(),
-            'slice_increment': self.slice_increment.get(),
-            'sort_stems': 1 if self.sort_stems.get() else 0,
-            'height_percentile': self.height_percentile.get(),
-            'tree_base_cutoff_height': self.tree_cutoff.get(),
-            'generate_output_point_cloud': 1 if self.generate_output.get() else 0,
-            'ground_veg_cutoff_height': self.veg_cutoff.get(),
-            'veg_sorting_range': 1.5,
-            'stem_sorting_range': 1.0,
-            'taper_measurement_height_min': 0,
-            'taper_measurement_height_max': 30,
-            'taper_measurement_height_increment': 0.2,
-            'taper_slice_thickness': 0.4,
-            'delete_working_directory': True,
-            'minimise_output_size_mode': 0,
-        }
+        parameters = fsct_job.job_parameters(
+            point_cloud_filename=file_path,
+            plot_radius=self.plot_radius.get(),
+            plot_radius_buffer=self.plot_buffer.get(),
+            batch_size=self.batch_size.get(),
+            num_cpu_cores=self.num_cores.get() if self.num_cores.get() > 0 else os.cpu_count(),
+            use_CPU_only=self.use_cpu.get(),
+            slice_thickness=self.slice_thickness.get(),
+            slice_increment=self.slice_increment.get(),
+            sort_stems=1 if self.sort_stems.get() else 0,
+            height_percentile=self.height_percentile.get(),
+            tree_base_cutoff_height=self.tree_cutoff.get(),
+            generate_output_point_cloud=1 if self.generate_output.get() else 0,
+            ground_veg_cutoff_height=self.veg_cutoff.get(),
+        )
 
-        output_dir = os.path.splitext(file_path)[0] + "_FSCT_output"
+        output_dir = fsct_job.output_dir_for(file_path)
         self.output_directory.set(output_dir)
+        self._stop_requested = False
 
         def process():
-            # Capture these before the try block. The old code assigned
-            # old_stdout inside the try and restored it in the except handler,
-            # so any failure before the assignment raised NameError and hid the
-            # real error.
-            old_stdout, old_stderr = sys.stdout, sys.stderr
-            # No terminal mirror: the run is shown in the processing console,
-            # and echoing it to the launching terminal as well just prints
-            # every progress line twice.
-            stream = ConsoleStream(self._console_sink)
-            sys.stdout = stream
-            sys.stderr = stream
-
+            # The pipeline runs in its own process (see fsct_job), so Stop can
+            # kill it. Its output arrives through one pipe, worker processes'
+            # included - those used to print to the launching terminal, out
+            # of the console's reach.
+            failure = None
             try:
-                # Normally already imported by the warm-up; if the user got
-                # here first this blocks the worker, not the window.
-                if not self.fsct_ready:
-                    self._set_stage("Loading FSCT modules")
-                fsct, defaults = load_fsct_modules()
-                parameters.update(defaults)
+                self._job = fsct_job.start(parameters)
+                if self._stop_requested:  # Stop landed before the job existed
+                    fsct_job.stop(self._job)
+                for text, transient in fsct_job.lines(self._job):
+                    if text.startswith(fsct_job.FAILURE_PREFIX):
+                        failure = text[len(fsct_job.FAILURE_PREFIX):]
+                    self._console_sink(text, transient)
+                code = self._job.returncode
+            except Exception as error:  # could not start the child at all
+                code, failure = -1, f"{type(error).__name__}: {error}"
+            finally:
+                self._job = None
 
-                fsct(
-                    parameters=parameters,
-                    preprocess=True,
-                    segmentation=True,
-                    postprocessing=True,
-                    measure_plot=True,
-                    make_report=True,
-                    clean_up_files=False,
-                )
-
+            if self._stop_requested:
+                self.console_log("")
+                self.console_log("Stopped. The output folder is incomplete.", "err")
+                self._on_main_thread(self.processing_stopped, output_dir)
+            elif code == 0:
                 self.console_log("")
                 self.console_log("=" * 62)
                 self.console_log("Processing complete", "ok")
                 self.console_log(f"Output directory: {output_dir}", "ok")
                 self.console_log("=" * 62)
                 self._on_main_thread(self.processing_complete, output_dir)
-
-            except Exception as e:
-                import traceback
+            else:
                 self.console_log("")
                 self.console_log("=" * 62, "err")
                 self.console_log("Processing failed", "err")
                 self.console_log("=" * 62, "err")
-                self.console_log(traceback.format_exc(), "err")
-                self._on_main_thread(self.processing_failed, str(e))
-
-            finally:
-                sys.stdout = old_stdout
-                sys.stderr = old_stderr
+                message = (failure or "").strip() or f"The FSCT process exited with code {code}."
+                self._on_main_thread(self.processing_failed, message)
 
         self._start_worker(process)
 
     def stop_inference(self):
-        """
-        Explain why there is nothing to cancel.
+        """Stop the running analysis: kill the job and its worker processes."""
+        if not self.processing or self._stop_requested:
+            return
+        if not messagebox.askokcancel(
+            "Stop analysis",
+            "Stop the running analysis?\n\n"
+            "Its output folder will be left incomplete.",
+        ):
+            return
+        self._stop_requested = True
+        self._set_stage("Stopping")
+        self.stop_btn.configure(state="disabled")
+        # taskkill and the wait for the process tree can take a moment; keep
+        # them off the window's thread. The reader thread sees the pipe close
+        # and reports the stop.
+        self._start_worker(lambda: fsct_job.stop(self._job))
 
-        FSCT() is a single long-running call with no cancellation points, so
-        there is nothing to interrupt mid-run. Be honest about that rather than
-        claiming it will "halt at the next checkpoint", which it never did.
-        """
+    def processing_stopped(self, output_dir):
+        self._finish_processing("Analysis stopped")
+        self._set_stage("Stopped")
         messagebox.showinfo(
-            "Cannot stop mid-run",
-            "FSCT runs as one uninterruptible job, so it cannot be cancelled "
-            "once it has started.\n\n"
-            "To abort, close this window - you will be asked to confirm, and "
-            "the partial output folder can then be deleted.",
+            "Analysis stopped",
+            f"The analysis was stopped. Its output folder is incomplete and can "
+            f"be deleted:\n\n{output_dir}",
         )
 
     def _finish_processing(self, status):
@@ -2363,7 +2294,7 @@ class FSCTStandaloneApp:
             messagebox.showerror("Error", f"Could not save the log:\n{e}")
 
     def _console_sink(self, text, transient):
-        """Called by ConsoleStream from the worker thread."""
+        """Called with each line of a run's output, from the worker thread."""
         level = "info"
         lowered = text.lower()
         if "error" in lowered or "traceback" in lowered or "failed" in lowered:
@@ -2371,10 +2302,9 @@ class FSCTStandaloneApp:
         elif "done" in lowered or "complete" in lowered:
             level = "ok"
 
-        for marker, stage in STAGE_MARKERS:
-            if marker.lower() in lowered:
-                self._set_stage(stage)
-                break
+        stage = fsct_job.stage_for(text)
+        if stage:
+            self._set_stage(stage)
 
         self._console_queue.append((text, level, transient))
 

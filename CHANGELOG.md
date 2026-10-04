@@ -1,394 +1,213 @@
 # Changelog
 
-Versioning is semantic: MAJOR for changes that alter measurements or break an
-existing workflow, MINOR for new capability that leaves results alone, PATCH for
-fixes with no effect on output. The version itself lives in `version.py`; run
-`FSCT.bat version` to print it.
-
-## 2.0.0
-
-A MAJOR bump because two reported measurements change: `Volume_1` in
-`tree_data.csv` was computed with a wrong formula, and `CCI_at_BH` was measured
-against the wrong points. Everything else here leaves results untouched, and
-was verified to: every CSV column and every LAS coordinate of
-`data/test/example_clean.las` matches the 1.0.0 output after the two
-measurement fixes, with the cylinder and stem files byte-identical. Regenerate
-any baseline you compare against.
-
-Benchmarks are on the same RTX 3050 / 16-core laptop as 1.0.0. It was far from
-idle this time — a WSL VM, an IDE and browsers held 12+ GB between them — so
-absolute times moved by 2x between runs and only back-to-back pairs are quoted.
-
-### Large point clouds no longer crash
-
-`data/test/ID0827_thin.las` — 5.1 million points, a 20 x 20 m plot — died at
-the end of segmentation on a 16 GB machine:
-
-    numpy._core._exceptions._ArrayMemoryError: Unable to allocate 623. MiB
-    for an array with shape (5104837, 16) and data type float64
-
-after the GPU had already done all its work. `choose_most_confident_label`
-asked the kNN for distances it never used (a second `(N, 16)` array) and took
-the median over one `(N, 16, 4)` gather, which numpy then needed a working copy
-of — about 3.5 GB of temporaries for 5 million points. The medians are taken a
-block of 250,000 points at a time now, with peak memory set by the block size
-rather than the plot, and the per-box network output is released before the
-labelled cloud is written. Labels are identical (checked on 673k points against
-the old code). The same file now completes end to end: **156 s** on a quiet
-machine, 270–280 s under load.
-
-Two more allocation patterns that scale with the cloud were fixed on the way:
-`load_file` rebuilt the whole cloud once per column it read (seven copies for
-xyz + rgb + label), and `save_file` called `las.add_extra_dim` once per extra
-column, each call copying the entire point record — 7 s of the post-processing
-stage on the 5M-point file. Both now do one allocation.
-
-### Measurement fixes
-
-- **`Volume_1` was wrong twice over.** The frustum volume between consecutive
-  cylinders read `(1/3) pi h (r1² + r1 + r2² + r2)` — adding a length to an
-  area — where a frustum is `(1/3) pi h (r1² + r1·r2 + r2²)`; at r1 = 0.5 m,
-  r2 = 0.3 m that overstates a segment by 2.3x. And the function's parameters
-  were named `diameter_1`, `diameter_2` and halved on entry, while its only
-  caller passes radii, so every radius was halved a second time. The two errors
-  partly cancelled, which is why the numbers looked plausible. On the example
-  plot tree 1's `Volume_1` moves from 1.61 m³ to 0.66 m³ — the old value
-  exceeded a solid cylinder of the tree's own DBH over its full height, which no
-  tapering stem can do; the new one sits beside `Volume_2` (0.53 m³), which is
-  estimated independently from DBH and height and never went through this code.
-- **`CCI_at_BH` used every tree's stem points.** The breast-height slice was
-  cut from the whole plot's stem cloud, not the tree's, so a neighbouring stem
-  falling in the 0.8–1.2 r annulus counted as coverage of this tree's
-  circumference. It is now the tree's own points. On the sparse example plot
-  the values happen not to change; on a dense plot they will.
-- **Branch-to-parent interpolation matched the wrong parent.** Two bugs in the
-  same block: `np.mean(parent_branch[:, :3])` with no axis returned a single
-  number instead of a centroid, and `np.linalg.norm(...)` with no axis likewise,
-  so `argmin` was always 0 and "the closest point of the current branch" was
-  whatever row came first. Then the candidate angles were filtered in place and
-  `argmin` of the *filtered* array was used to index the *unfiltered* candidate
-  list, picking a different cylinder than the one with the smallest angle. Both
-  fixed. They did not change the example plot's outputs, since they only bite
-  when a branch has several parent candidates within `max_search_radius`.
-- **The "VOLUME 2" annotation line was missing** from `text_point_cloud.las` in
-  the default (uncropped) mode; only the tree-aware-cropping branch stacked it.
-- **Division by zero on degenerate plots.** The coverage fractions and
-  `Stems/ha` divided by the sample-cell count and the plot area with no guard;
-  a plot whose DTM hull contained no grid cell, or with zero hull area, took the
-  whole run down with `ZeroDivisionError` — once at the very end, after all the
-  work was done. They now report 0.
-- **`save_file` silently wrote nothing** for `.LAS` (upper case) or `.laz`: the
-  extension check was `filename[-4:] == ".las"`, so neither branch matched and
-  the function returned without an error. It now matches case-insensitively,
-  like `load_file`, and raises on an unsupported extension.
-- **Multi-core subsampling results depended on worker scheduling.** The
-  subsampled slices were collected with `imap_unordered`, so the row order of
-  the thinned cloud — and of everything derived from it — varied run to run.
-  Now `imap`. Only reachable with `subsample` enabled.
-
-One more found and deliberately left alone: the step that was meant to fold
-DBSCAN's leftover "noise" skeleton points into their nearest cluster never did
-anything. It wrote through a chained fancy index (into a temporary that was
-discarded) *and* searched for neighbours only among the other unassigned points,
-whose label is -1 by definition. Those points are silently dropped today.
-`assign_unassigned_skeleton_points` in `other_parameters.py` makes the step work
-as described and is **off by default**, because recovering skeleton points
-changes which stems get cylinders fitted.
-
-### Speed
-
-Measurement stage on `example_clean.las`, 16 workers, back to back:
-**20.0 s → 13.7 s**; the fastest of three later runs was 10.0 s against a
-1.0.0 baseline of 18.2 s taken under the same conditions.
-
-What the profile said, and what changed:
-
-- **Worker start-up outweighed the work three to one.** Sampled across all 16
-  workers, 146 s of CPU went on imports — each worker re-importing numpy,
-  scipy, sklearn, pandas, networkx, laspy and hdbscan from a bare interpreter,
-  about 9 s each under contention — against 54 s of actual clustering and
-  circle fitting. pandas, networkx, laspy, skspatial and DBSCAN are only ever
-  used by the parent and are now imported where they are used, taking a worker's
-  import from 4.0 s to 3.3 s (sklearn, which hdbscan needs, is the floor).
-  More usefully, the pool is now started **before segmentation** with a Pool
-  initializer that forces those imports, so the workers come up while the GPU
-  is busy and the CPU is idle, and are ready when measurement begins. This is
-  gated on free memory: idle workers hold ~150 MB each and segmentation is
-  where the parent's own memory peaks, so on a machine that is already paging
-  the pool starts at the measurement stage as before. `prewarm_worker_pool` in
-  `other_parameters.py` turns it off.
-- **No more barriers between task batches.** Tasks were submitted in batches of
-  128 with a wait for the whole batch after each, so one big stem cluster
-  idled the other 15 workers until it finished — 32 s of worker CPU for
-  cylinder fitting took 7.4 s of wall. Submission is now a sliding window
-  (a semaphore keeps the same bound on tasks in flight), results are taken in
-  completion order and slotted back by index, and tasks are submitted largest
-  first. Every task is seeded per cluster, so neither order changes any output.
-- **The DTM was re-triangulated twice per tree.** `griddata` builds a Delaunay
-  triangulation on every call and measurement called it once per tree in the
-  interpolation loop, once per tree when collecting tree data, and once per
-  tree to find the base height — for one point. `DTMInterpolator` builds it
-  once; identical values (`griddata(method="linear")` *is*
-  `LinearNDInterpolator`). 20 per-tree calls against a 4,000-point DTM: 0.96 s
-  → 0.22 s; against 20,000 points: 7.3 s → 0.75 s.
-- **Skeleton-to-stem-point matching was brute force.** The cKDTrees for it were
-  built with `leafsize=100000`, which makes the dual-tree query compare every
-  skeleton point against every stem point. Leaf size changes only how the same
-  neighbour sets are found: 3.65 s → 0.04 s on a synthetic 300k × 6k match,
-  identical sets. The per-cluster boolean scans of the skeleton array and the
-  per-cluster tree builds around it are replaced by one query and one grouping.
-- **Quadratic array growth** in the tree-data loop (six arrays re-stacked per
-  tree, two of them whole point clouds), the cylinder-interpolation loop (three
-  nesting levels deep) and the skeleton visualisation, and the per-tree boolean
-  scans of the vegetation and stem clouds — millions of rows scanned once per
-  tree. All now group once and stack once.
-- **Canopy / understorey / CWD cover** ran a Python loop over every 0.2 m grid
-  cell with a generator-based convex-hull test and three `query_ball_point`
-  calls per cell, each building an index list just to take its length. One
-  matrix product for the hull test and three threaded counting queries.
-- **DTM construction** — the per-cell radius-widening search over the terrain
-  tree is done as four threaded counting queries over all cells at once, with
-  the radii accumulated exactly as the loop did so boundary points land the
-  same side; identical DTMs at 0.5 m and 0.3 m. The vegetation and stem
-  sorting queries run on all cores.
-- The point-based text annotations grew their array one point at a time in a
-  nested Python loop over the character bitmap; `np.argwhere` gives the same
-  points in the same order, 26x faster, seven times per tree.
-
-### A dead worker no longer hangs the run
-
-If a worker process is killed — the OS reclaiming memory is the usual cause —
-`multiprocessing.Pool` starts a replacement but never re-runs the task the
-dead one was holding, and `imap` waits for it forever. In the desktop app that
-was a run that never finished, with no error anywhere. The result loop now
-polls with a timeout and, if the pool's worker set has changed, raises an
-error that says what happened and what to try. `close_pool` uses `terminate()`
-rather than `close()` + `join()`, since after a lost task the pool's result
-cache never drains and `join()` never returned either — the raised error was
-never reaching the user. Verified by killing a worker mid-task: error in 30 s,
-clean shutdown.
+Versioning is semantic, counting the original FSCT
+([SKrisanski/FSCT](https://github.com/SKrisanski/FSCT)) as version 0. MAJOR is
+for changes that alter measurements or break an existing workflow, MINOR for new
+capability that leaves results alone, PATCH for fixes with no effect on output.
+The version lives in `version.py`; `FSCT-Turbo.bat version` prints it.
 
 ## 1.0.0
 
-First versioned release.
+The first release of FSCT-Turbo. Everything below is relative to the original
+FSCT at commit `68e2f1e`, run with the library-compatibility edits it needs on
+current Python packages. The segmentation model, its trained weights and the
+measurement method are unchanged and remain the original authors' work.
 
-This project is upstream FSCT — <https://github.com/SKrisanski/FSCT>, by Sean
-Krisanski — with two user interfaces, an unattended installer and a
-substantially faster, reproducible processing chain wrapped around it. The
-segmentation model and the measurement method are the original work; what
-follows is what differs.
+Measurements on the 673,517-point `data/test/example.las`, on a laptop with a
+Ryzen 7 7735HS (16 threads), 16 GB RAM and an RTX 3050 Laptop GPU (4 GB).
 
-Benchmarks below are on the 673k-point `data/test/example.las`, an RTX 3050
-Laptop (4 GB) with 16 CPU cores, on an otherwise idle machine. Absolute
-wall-clock times move a lot with background load — the same measurement stage
-ran 19.5 s idle and 44 s with a browser and an editor open. Every before/after
-pair was measured back to back under the same conditions, so the ratios hold
-where the absolute numbers do not.
+### Exact, consistent results
 
----
+The original FSCT is not repeatable: two runs of the same file disagree on 7 to
+8% of point labels, and on a CPU-only machine it segments markedly worse than
+on a GPU. FSCT-Turbo gives one answer for a file and seed: bit-identical across
+runs, CPU core counts, batch sizes, filesystems and positions within a batch
+job. Each source of variation, and what replaced it:
 
-### Functionality added over upstream FSCT
+- **Box subsampling.** Boxes over `max_points_per_box` were subsampled with an
+  unseeded shuffle. They are seeded by the box's index in the global box array,
+  so the result does not depend on how boxes are shared among threads.
+- **Farthest-point sampling** in the network started from a random point,
+  drawn by torch_cluster from a different generator on each device (torch's
+  CUDA generator on the GPU, C's `rand()` on the CPU, which no seed reaches),
+  from one stream shared across the batch. The start is now drawn per box from
+  `(random_seed, box id)`, the same on every device and at any batch size.
+- **The network's neighbourhoods on CPU.** Each sampled point gathers at most 64
+  neighbours. torch_cluster's CUDA kernel keeps the first 64 in index order, the
+  neighbourhoods the model was trained on; its CPU kernel keeps the first 64 in
+  k-d tree order, a different set for 211 of 215 queries in a dense test cloud.
+  CPU inference therefore fed the model neighbourhoods it had never seen, which
+  is why CPU segmentation was worse (2 trees instead of 4 on the example plot).
+  The CPU path now selects exactly what the CUDA kernel selects.
+- **Self-loops leaked between boxes.** PointNetConv's self-loop step pairs
+  sampled point *i* with input point *i* by index across the whole batch, so a
+  box's features leaked into its batch-mate's and the labels depended on the
+  batch size (batch 4 against batch 2: 21,593 labels). The same pairing is now
+  made within each box, exactly what PyG does for a box on its own.
+- **Box order.** Box files were read in the order the filesystem lists them,
+  which decided batching and the order of the assembled cloud. They are read in
+  box-id order.
+- **Feature interpolation** summed neighbours with GPU atomics, in whatever
+  order they landed. It is summed in a fixed order.
+- **RANSAC circle fits** were unseeded; they are seeded per stem cluster.
+- **Worker results** were collected in completion order, so the row order of
+  every downstream array depended on process scheduling; they are collected in
+  task order.
+- **Precision.** Segmentation runs in fp32 by default, with deterministic cuDNN
+  settings and TF32 off. `use_amp=True` runs it in fp16 (with TF32), about 15%
+  faster on that stage and half the activation memory, but not bit-exact: 2
+  of 673,517 labels differed between identical runs.
 
-Upstream is run by editing parameters at the top of `scripts/run.py` and
-executing it, against a conda environment you assemble yourself.
+All of it follows `random_seed` in `scripts/other_parameters.py` (default `0`);
+`None` restores the original non-reproducible behaviour.
 
-- **Desktop application** (`fsct_desktop.py`) — file picker, header inspection
-  without loading the points, parameter controls, live console, results browser
-  and a plot summary view.
-- **Browser UI** (`fsct_web.py`) — the same pipeline as a Streamlit app, with
-  interactive 3D point cloud, height and DBH distributions, stem map and
-  DBH-height scatter (`visualization_utils.py`).
-- **One-shot installation** (`FSCT.bat`) — builds the conda environment,
-  installs a matching PyTorch/PyG/torch-cluster triple, installs both
-  interfaces and downloads LAStools, asking nothing. Also exposes `gui`, `web`,
-  `setup`, `verify`, `lastools`, `version` and `help` subcommands.
-- **Unattended batch processing** (`batch_process.py`) — process a directory
-  tree of point clouds from the command line and combine the per-plot summaries,
-  where upstream's directory mode opens a Tk folder dialog.
-- **LAStools integration** (`setup_lastools.py`) — automatic download and
-  configuration, with LAS/LAZ conversion, resampling and an external 3D viewer
-  wired into both UIs.
-- **Installation self-test** (`test_installation.py`, `FSCT.bat verify`) —
-  checks the Python version, the deep-learning stack, the linear-algebra
-  routines, point-cloud and reporting libraries, core files, the FSCT imports
-  and optional GPU/LAStools/UI components.
-- **Reproducible runs.** See below.
-- **Versioning.** `version.py` as the single source of truth, surfaced in both
-  UIs, the installation test, `FSCT.bat version` and `batch_process --version`.
+Verified on the example plot, in fp32, against a run at batch size 2 on 8
+cores (176,992 stem points, 4 trees):
 
-### Reproducibility
+| Run                                            | Labels that differ (of 673,517) |
+| ---------------------------------------------- | ------------------------------- |
+| Batch size 1                                   | 0                               |
+| Batch size 4                                   | 0 (21,593 before)               |
+| 16 cores, second run in the same process       | 0                               |
+| Complete default run in a fresh process        | 0                               |
+| CPU instead of GPU                             | 84 (212,634 before)             |
+| Original FSCT, against another original run    | 7 to 8%, about 50,000           |
 
-Upstream runs are not repeatable: the same file processed twice disagrees on
-roughly 10% of point labels. Four things were unseeded —
+A complete CPU run measured the same four trees as the GPU run, with identical
+DBH, height, `Volume_2` and `CCI_at_BH`; `Volume_1` differed by at most
+0.003 m³ (0.3%). Before, the CPU found 2 trees.
 
-- boxes over `max_points_per_box` were subsampled with an unseeded
-  `random.shuffle`
-- the farthest-point-sampling in `scripts/model.py` picks a random start
-  (`torch_cluster.fps` defaults to `random_start=True`)
-- the RANSAC circle fits
-- worker results were collected in completion order, so the row order of every
-  downstream array depended on process scheduling
+The end-to-end test (`FSCT_E2E=1`) checks two complete runs at different batch
+sizes and core counts: identical labels and byte-identical `tree_data.csv`,
+`taper_data.csv` and `cleaned_cyls.csv`.
 
-All four are now driven by `random_seed` in `scripts/other_parameters.py`
-(default `0`); set it to `None` for the old behaviour. The box seed is derived
-per box id and the circle-fit seed per stem cluster, so neither depends on
-thread or worker scheduling — **results do not depend on the CPU core count**.
+What remains approximate is floating-point arithmetic across hardware: a CPU
+and a GPU round sums differently, which can flip a point whose two best class
+scores are within rounding of each other.
 
-Two caveats: reproducibility holds for the same file, seed *and* batch size, as
-changing the batch regroups the samples; and with `use_amp=True` reproduction is
-very close but not bit-exact, measured at 2 differing labels out of 673,517
-(0.0003%). Seeded fp32 runs matched exactly.
+### Measurement corrections
+
+These change reported values relative to the original FSCT.
+
+- **`Volume_1` was wrong twice over.** The frustum volume between consecutive
+  cylinders read `(1/3) pi h (r1² + r1 + r2² + r2)`, adding a length to an
+  area, where a frustum is `(1/3) pi h (r1² + r1·r2 + r2²)`; and every radius
+  was halved a second time on the way in. The errors partly cancelled, so the
+  numbers looked plausible: tree 1 of the example plot read 1.61 m³, more than
+  a solid cylinder of its own DBH over its full height, against 0.66 m³ now and
+  an independently estimated `Volume_2` of 0.53 m³.
+- **`CCI_at_BH` used every tree's stem points**, so a neighbouring stem in the
+  0.8 to 1.2 r annulus counted as coverage of this tree's circumference. It uses
+  the tree's own points.
+- **Branch-to-parent interpolation matched the wrong parent.** A mean and a norm
+  without an axis made "the closest point of the current branch" whatever row
+  came first, and the smallest-angle candidate was looked up in a filtered
+  array but taken from the unfiltered one.
+- **The "VOLUME 2" line was missing** from `text_point_cloud.las` in the default
+  (uncropped) mode.
+
+Kept on purpose, so measurements stay comparable with published FSCT results:
+
+- **Cylinder sorting emits one cylinder short**, as the original loop does.
+- **CCI sectors are not evenly spaced**: the sector angles are built in degrees
+  but used as radians. `fix_cci_sectors=True` corrects it; it is off by default
+  because CCI decides which cylinders survive, so stem count, DBH and height
+  move with it.
+- **The skeleton-point recovery step never worked** (it wrote into a temporary
+  and searched only among unassigned points). `assign_unassigned_skeleton_points`
+  makes it work; off by default for the same reason.
 
 ### Speed
 
-Whole pipeline:
+Interleaved runs of the original and FSCT-Turbo, 8 workers, batch size 2, each
+ratio comparing runs minutes apart:
 
-| Stage | Upstream | Here |
-|---|---|---|
-| Preprocessing | 4.04 s | 0.70 s |
-| Segmentation | 24.1 s | 17.0 s |
-| Post-processing | — | 1.6 s |
-| Measurement | see below | 19.5 s |
+| Stage           |     Original | FSCT-Turbo (fp32, default) |   FSCT-Turbo (fp16) |
+| --------------- | -----------: | -------------------------: | ------------------: |
+| Preprocessing   |       3.68 s |              0.85 s (4.3x) |       0.88 s (4.2x) |
+| Segmentation    |      21.17 s |            18.36 s (1.15x) |     15.47 s (1.37x) |
+| Post-processing |       1.53 s |             1.32 s (1.16x) |      1.24 s (1.23x) |
+| Measurement     |     304.07 s |            13.81 s (22.0x) |     12.87 s (23.6x) |
+| **Total**       | **330.46 s** |         **34.35 s (9.6x)** | **30.46 s (10.8x)** |
 
-The measurement stage was dominated by circle fitting. `skimage.measure.ransac`
-was called with `min_samples` at 30% of the slice and `max_trials=10000` — a
-combination for which RANSAC's early-stopping rule almost never fires, so nearly
-every circle ran all 10,000 trials, each a Python-level `np.linalg.lstsq` plus a
-residual pass over every point in the slice.
+These were timed before the consistency changes above, which add some index
+arithmetic per batch and turn TF32 off in fp32. Timed afterwards, alternating
+with the code before them, segmentation took 23.1 s against 22.0 s (three runs
+each, ranges 20.9 to 25.4 s and 19.0 to 23.5 s): within this machine's noise.
 
-| Measurement | Upstream | Here | |
-|---|---|---|---|
-| One circle fit (60 real stem slices) | 2737 ms | 28.6 ms | **96x** |
-| Cylinder fitting, all clusters, single process | 1739 ms/cyl | 29 ms/cyl | **60x** |
+- **Circle fitting** was 92% of the original run: `skimage.measure.ransac` with
+  `min_samples` at 30% of the slice and 10,000 trials, a combination for which
+  the early-stopping rule never fires. Trials are now formed, solved and scored
+  as arrays (2.6x on its own), capped at 1,000 and fitted on at most 1,500
+  points per slice (69x in all, 2,039 ms to 29.4 ms per fit). The fitted radius
+  moves by a median of 0.7 mm, against 0.1 mm between two runs of the original
+  fit. `circle_fit_trials=10000` and `circle_fit_max_points=0` restore the
+  original cost.
+- **Box extraction** scanned the whole cloud once per box. One shared k-d tree,
+  queried with a Chebyshev ball (exactly an axis-aligned cube) and gathered in
+  index order, gives byte-identical boxes; the GIL is released, so the threads
+  run in parallel.
+- **Segmentation output** left the GPU in seven blocking copies per batch, four
+  of them in a per-sample loop; now one.
+- **Quadratic algorithms removed.** Cylinder sorting, cleaning and volume
+  summation rebuilt a spatial index and copied the array per cylinder; one index
+  and an active mask give the same order and neighbourhoods. Arrays grown with
+  `np.vstack` inside loops (DTM construction, tree data, cylinder interpolation,
+  text annotations) are stacked once. The DTM was re-triangulated three times
+  per tree; once now.
+- **Full scans in loops.** Slice and plane cutting sort once and binary-search;
+  cover fractions use one matrix product and threaded counting queries; the
+  skeleton-to-stem match used a k-d tree leaf size that made it brute force.
+- **One worker pool**, started during GPU segmentation when memory allows,
+  replaces four pools spawned on demand (each spawn re-imports the scientific
+  stack per worker on Windows). Tasks are submitted largest first through a
+  sliding window, with no barrier between batches.
+- **Batch size.** Bigger is not faster on a small card: in fp32 on 4 GB, batch
+  2 took 17.0 s, batch 4 25.3 s and batch 6 54.2 s, as activations spilled to
+  host memory. The desktop app suggests a batch size from the detected VRAM.
 
-What changed:
+### Reliability
 
-- **Batched circle RANSAC.** Trials are sampled, fitted and scored with array
-  operations instead of one Python loop iteration each, with the same dynamic
-  stopping rule applied after every batch — same model, same scoring, same
-  criterion. Agreement with skimage on 60 real stem slices: median radius
-  difference 1.5 mm, 95th percentile 33 mm, against 35 mm of disagreement
-  between two independent skimage runs on the same slices. `circle_fit_trials`
-  and `circle_fit_max_points` control the trial count and point cap.
-- **Indexed plane slicing.** Selecting points near each circle's plane scanned
-  the whole stem cluster once per skeleton position; it now binary-searches a
-  pre-sorted coordinate and returns an identical slice.
-- **Cylinder sorting and cleaning are no longer quadratic.** Both rebuilt a
-  spatial index and copied the whole array every iteration — O(n² log n) in
-  cylinders. One index plus an active mask gives the same processing order and
-  the same neighbourhoods.
-- **Vectorised cylinder visualisation.** It dispatched one pool task per
-  cylinder to produce 15 points; the two visualisation passes were 21 s of a
-  55 s stage and are now under a second.
-- **Parallel slice clustering**, with slice cutting binary-searching a sorted
-  height instead of boolean-scanning the whole stem cloud per slice.
-- **One shared worker pool.** Spawning a pool on Windows re-imports numpy,
-  scipy, sklearn and hdbscan in every worker; that startup was being paid three
-  times per run (slice clustering, cylinder fitting, cylinder cleaning).
-- **Box extraction was O(boxes × points)** — it boolean-scanned the entire cloud
-  once per box. Now one shared `cKDTree` queried with a Chebyshev (p=inf) ball,
-  which is exactly an axis-aligned cube. `cKDTree` releases the GIL, so the
-  worker threads genuinely run in parallel.
-- **Segmentation output assembly** called `.cpu()` seven times per iteration,
-  four inside a per-sample inner loop, each a blocking device sync. It also
-  built an `(N, 16, 7)` temporary — about 600 MB at 700k points — to read four
-  columns.
-- **Mixed precision** (`use_amp`), which on a small GPU matters as much for
-  memory as for arithmetic. Roughly halves both runtime and activation memory
-  and shifts ~0.17% of labels; ignored on CPU.
-- **DTM construction** grew its array with `np.vstack` inside a nested loop,
-  making it quadratic in grid cells — 40,000 cells for a 100 × 100 m plot at
-  0.5 m resolution.
+- **Large clouds.** A 5.1-million-point plot ran out of memory at the end of
+  segmentation on a 16 GB machine (the label transfer built about 3.5 GB of
+  temporaries). Labels are now transferred in blocks of 250,000 points; the
+  plot completes in 156 s. `load_file` and `save_file` no longer copy the whole
+  cloud once per column.
+- **A dead worker no longer hangs the run.** If the OS killed a measurement
+  worker, the run waited forever. It now stops within 30 s with an explanation.
+- **Plots with no trees** complete with an empty `tree_data.csv`; degenerate
+  plots (no DTM grid cell, zero hull area) no longer end in `ZeroDivisionError`.
+- **Current libraries.** `np.percentile(interpolation=)` (numpy 2),
+  `read_csv(delim_whitespace=)` (pandas 3) and the `DataLoader` and
+  `PointConv` moves in PyG 2 each crashed the original.
+- **Paths and files.** `get_fsct_path` worked only in a folder named exactly
+  `FSCT`. `load_file` crashed and `save_file` silently wrote nothing for
+  `.LAS` in upper case or `.laz`. Optional subsampling duplicated points across
+  slice boundaries and collected slices in completion order.
+- **Training tools.** `training_monitor.py` caught the wrong exception and read
+  a misspelt path, so it redrew an empty figure forever.
 
-The desktop app picks a default batch size from detected VRAM, because bigger is
-not faster: in fp32 on a 4 GB card, batch 2 took 17.0 s at 1.37 GB peak, batch 4
-took 25.3 s at 2.42 GB, and batch 6 took 54.2 s at 3.28 GB. Past roughly 2.5 GB
-the driver pages activations to host memory and throughput collapses.
+### Interfaces and tooling
 
-### Correctness and compatibility over upstream
+The original is run by editing the parameters at the top of `scripts/run.py`.
 
-Fixed:
-
-- **Runs on current libraries.** `np.percentile(..., interpolation=)` was
-  removed in numpy 2.0 and crashed the measurement stage just before tree
-  heights were computed; `pandas.read_csv(delim_whitespace=)` was removed in
-  pandas 3.0; `DataLoader` moved out of `torch_geometric.data` in PyG 2.0.
-- **`get_fsct_path` worked only in a folder named exactly `FSCT`.** It truncated
-  `os.getcwd()` at the first "FSCT" substring, so any other folder name resolved
-  to a sibling directory that does not exist, and a path without "FSCT" in it
-  raised `ValueError`. It is now derived from the module's own location.
-
-Known upstream quirks, reproduced on purpose so measurements stay comparable:
-
-- **Cylinder sorting emits one cylinder short.** The original loop stops with
-  the last cylinder still unsorted and never emits it. The rewritten sort keeps
-  that behaviour rather than silently changing every plot's cylinder count.
-- **CCI sectors are not evenly spaced.** The sector angles are built in degrees
-  but consumed as radians, so the 80 "evenly spaced sectors" are really 80
-  arbitrary directions. They land quasi-uniformly, so CCI still roughly tracks
-  circumferential coverage, but the values are not what the method describes.
-  `fix_cci_sectors` in `other_parameters.py` corrects it and is **off by
-  default**: CCI decides which cylinders survive, so stem count, DBH and tree
-  height all move with it.
-
----
-
-### Changes since the last unversioned build of this fork
-
-If you have output from a pre-1.0.0 build of *this* project, two fixes alter the
-numbers. Regenerate any baseline you compare against.
-
-- **Segmentation no longer depends on the CPU core count.** Boxes seeded their
-  `max_points_per_box` subsample with an id counted within each thread's share
-  of the work, so the same box drew a different seed at every core count. On
-  `data/test/example_clean.las`, 4 cores and 16 cores disagreed on 74,219 of
-  673,517 point labels (11%) — enough to report 3 trees instead of 4, and to
-  move DBH, height and volume with it. The seed is now keyed to the box's index
-  in the full box array, so every core count agrees with a single-threaded run;
-  the same comparison now differs on 2 labels, the `use_amp` fp16 jitter. Before
-  this fix, one point cloud analysed on an 8-core laptop and a 32-core
-  workstation gave different tree counts.
-- **Multi-core subsampling no longer duplicates points.** With
-  `num_cpu_cores > 1`, `subsample_point_cloud` asked a kd-tree for every point
-  within one slice-width of each slice's lower bound. That search runs in both
-  directions, so slices were twice as wide as the step between them and
-  overlapped by half; every overlapped point was thinned twice and both copies
-  kept. A 20,000 point cloud at `min_spacing=0.05` came back with 34,741 points,
-  14,838 of them exact duplicates, at a minimum spacing of 0. Slices now tile the
-  cloud exactly once, with a halo so points near a boundary are still thinned
-  against their real neighbours. Only reachable with `subsample` enabled, which
-  is off by default.
-
-#### Fixed
-
-- `wrapper_config.json` was missing its closing brace, so `batch_process.py`
-  aborted with a `JSONDecodeError` before processing a single file. The config is
-  repaired, and `load_config` now reports an unreadable config and continues on
-  defaults instead of raising.
-- `load_file` raised `UnboundLocalError: cannot access local variable
-  'pointcloud'` for any extension that was not exactly `.las`, `.laz` or `.csv`
-  in lower case — including `PLOT.LAS`. Extensions are matched case-insensitively
-  and an unsupported format now raises an error naming the file and format.
-- `batch_process.get_las_files` globbed case-sensitively and silently skipped
-  uppercase `.LAS`/`.LAZ` files.
-- The browser UI built conversion output paths with `str.replace`, which rewrites
-  every occurrence in the path, not just the extension: `surveys/site.laz/plot.laz`
-  became `surveys/site.las/plot.las`, pointing at a directory that does not exist.
-- `training_monitor.py` read `except OSError or IndexError`, which evaluates to
-  `except OSError` — `IndexError` was never caught. It also built its history
-  path by concatenation onto a directory with no trailing separator, asking for
-  `model/../modeltraining_history.csv`; the resulting `FileNotFoundError` was
-  swallowed by that same handler, so the monitor redrew an empty figure forever.
-- `subsample` crashed on inputs of fewer than two points
-  (`Expected n_neighbors <= n_samples_fit`).
-
-#### Changed
-
-- The six plot builders in `visualization_utils.py` now log why a figure could
-  not be built. They still return `None` so a page can skip the chart, but a
-  missing column, an unreadable file and a plotly error are no longer
-  indistinguishable from each other and from success.
-- Corrected the `subsample` comment in `other_parameters.py`, which said
-  "generally leave this on" beside a value of `0`.
-- Removed 61 unused imports and a dead `DataLoader` compatibility shim. Verified
-  no-ops: restoring them reproduced segmentation labels for all 673,517 points.
+- **Desktop application** (`fsct_desktop.py`): header-only file inspection,
+  conversion, resampling and LAStools viewing, every parameter with an
+  explanation, a live console with the current stage, a results browser, and a
+  **Stop** button that ends the run and its worker processes.
+- **Browser UI** (`fsct_web.py`): the same pipeline in Streamlit, with an
+  interactive 3D view, distributions, a stem map and a DBH-height scatter. A run
+  keeps going while the page is used and shows its stage and output live.
+- **Both run the pipeline in a child process** (`fsct_job.py`), from one set of
+  default parameters, so Stop can end it and a closed window does not leave it
+  running.
+- **Installer and launcher** (`FSCT-Turbo.bat`): builds the conda environment
+  with a matching PyTorch, PyTorch Geometric and torch-cluster, installs both
+  interfaces and downloads LAStools, asking nothing.
+- **Unattended batch processing** (`batch_process.py`): a directory tree from
+  the command line, parameters from `wrapper_config.json`, summaries combined,
+  and an exit code that reports failures.
+- **Checks**: `test_installation.py` (`FSCT-Turbo.bat verify`) for the
+  environment, and regression tests in `tests/`
+  (`python -m unittest discover -s tests`; `FSCT_E2E=1` adds a full run of the
+  example plot).

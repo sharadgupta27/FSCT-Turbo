@@ -25,11 +25,17 @@ sys.setrecursionlimit(10**8)  # Can be necessary for dealing with large point cl
 
 
 class TestingDataset(Dataset, ABC):
-    def __init__(self, root_dir, points_per_box, device):
+    def __init__(self, root_dir, points_per_box, device, random_seed=None):
         super().__init__()
-        self.filenames = glob.glob(root_dir + "*.npy")
+        # Sorted, i.e. in box-id order. glob returns files in whatever order
+        # the filesystem lists them - alphabetical on NTFS, arbitrary on
+        # ext4 - and the order decided which boxes shared a batch and the order
+        # of the assembled cloud, whose duplicate points break kNN ties by
+        # position. Results could differ between machines for that alone.
+        self.filenames = sorted(glob.glob(root_dir + "*.npy"))
         self.device = device
         self.points_per_box = points_per_box
+        self.random_seed = random_seed
 
     def __len__(self):
         return len(self.filenames)
@@ -47,7 +53,18 @@ class TestingDataset(Dataset, ABC):
         # Place sample at origin
         local_shift = torch.round(torch.mean(pos, dim=0))
         pos = pos - local_shift
-        return Data(pos=pos, x=None, local_shift=local_shift)
+
+        # The farthest-point-sampling starts for the model's two sampling
+        # layers (see model.seeded_fps), from the seed and this box's id - the
+        # same scheme preprocessing uses to subsample the box. A box's labels
+        # then depend only on the box: not on the batch size, the device, or
+        # which boxes it is batched with.
+        if self.random_seed is None:
+            fps_u = torch.rand(1, 2, dtype=torch.float64)
+        else:
+            box_id = int(os.path.splitext(os.path.basename(self.filenames[index]))[0])
+            fps_u = torch.from_numpy(np.random.default_rng([self.random_seed, box_id, 1]).random((1, 2)))
+        return Data(pos=pos, x=None, local_shift=local_shift, fps_u=fps_u)
 
 
 def choose_most_confident_label(point_cloud, original_point_cloud, chunk_size=250000):
@@ -129,10 +146,8 @@ class SemanticSegmentation:
         self.plot_centre = [[float(self.plot_summary["Plot Centre X"].iloc[0]), float(self.plot_summary["Plot Centre Y"].iloc[0])]]
 
     def inference(self):
-        # The farthest-point-sampling in scripts/model.py picks a random
-        # starting point (torch_cluster.fps defaults to random_start=True), so
-        # the network is not deterministic on its own. Seeding here makes a
-        # rerun on the same file reproduce its labels exactly.
+        # The sampling starts are seeded per box by the dataset. These cover
+        # anything else that draws from the global generators.
         random_seed = self.parameters.get("random_seed")
         if random_seed is not None:
             torch.manual_seed(random_seed)
@@ -141,7 +156,10 @@ class SemanticSegmentation:
             np.random.seed(random_seed)
 
         test_dataset = TestingDataset(
-            root_dir=self.working_dir, points_per_box=self.parameters["max_points_per_box"], device=self.device
+            root_dir=self.working_dir,
+            points_per_box=self.parameters["max_points_per_box"],
+            device=self.device,
+            random_seed=random_seed,
         )
 
         # Samples are plain CPU tensors now, so they can be pinned for faster
@@ -172,25 +190,22 @@ class SemanticSegmentation:
 
         model.eval()
 
-        # Mixed precision. On the benchmark cloud (RTX 3050, 4 GB) this took
-        # segmentation from 17.0 s to 8.4 s at batch_size 4 - and it halves
-        # activation memory, which matters more than the arithmetic on small
-        # cards: in fp32 this model needs 3.3 GB at batch_size 6 and starts
-        # spilling to host memory, which made *larger* batches slower.
-        #
-        # It shifts about 0.17% of point labels, all of them points where the
-        # top two class probabilities were near-tied. For scale, FSCT's own
-        # unseeded randomness used to move 8.76% of labels between runs of the
-        # same file. Set use_amp=False in other_parameters.py to disable.
-        use_amp = bool(self.parameters.get("use_amp", True)) and self.device.type == "cuda"
-        if use_amp:
-            print("Using mixed precision (fp16). Set use_amp=False to disable.")
-
-        # TF32 costs about 0.015% of labels and is a straight win on Ampere
-        # and newer for the layers autocast leaves in fp32.
+        # Mixed precision is opt-in (use_amp in other_parameters.py). On the
+        # benchmark cloud (RTX 3050, 4 GB) it took segmentation from 18.4 s to
+        # 15.5 s and halves activation memory, but it is not exact: fp16
+        # reductions are not bit-reproducible (2 labels in 673,517 differed
+        # between identical runs) and it shifts about 0.17% of labels against
+        # fp32. TF32 rides along with it for the same reason - it rounds
+        # matmul inputs to 10 mantissa bits, on Ampere and newer only, so it
+        # would also make results depend on the GPU generation.
+        use_amp = bool(self.parameters.get("use_amp", False)) and self.device.type == "cuda"
         if self.device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_tf32 = use_amp
+            torch.backends.cudnn.allow_tf32 = use_amp
+            torch.backends.cudnn.benchmark = False  # no timing-dependent algorithm choice
+            torch.backends.cudnn.deterministic = True
+        if use_amp:
+            print("Using mixed precision (fp16, TF32): faster, but not bit-reproducible.")
 
         num_boxes = test_dataset.__len__()
         with torch.no_grad():

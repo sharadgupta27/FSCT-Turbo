@@ -105,7 +105,16 @@ class Preprocessing:
 
         for i in range(pds):
             if kdtree is not None:
-                candidate_idx = kdtree.query_ball_point(point_divisions[i], r=query_radius, p=np.inf)
+                # Sorted, so the box keeps the cloud's point order. The tree
+                # returns indices in traversal order, and order is not
+                # cosmetic: the segmentation model's radius search keeps the
+                # first 64 neighbours by index, so the same points in another
+                # order get different labels. Gathering unsorted labelled ~9%
+                # more of the example plot as stem than the original code, a
+                # systematic shift rather than run-to-run noise.
+                candidate_idx = kdtree.query_ball_point(
+                    point_divisions[i], r=query_radius, p=np.inf, return_sorted=True
+                )
                 if len(candidate_idx) <= min_points_per_box:
                     continue  # cannot pass the test below, skip the gather
                 candidates = point_cloud[candidate_idx]
@@ -113,8 +122,8 @@ class Preprocessing:
                 candidates = point_cloud
 
             # Re-apply the exact half-open bounds. The tree query is inclusive
-            # on both sides and may be over-sized, so this keeps the selection
-            # byte-identical to the original full scan.
+            # on both sides and may be over-sized; this, with the sorted gather
+            # above, keeps the box byte-identical to the original full scan.
             xyz = candidates[:, :3]
             keep = np.all((xyz >= box_centre_mins[i]) & (xyz < box_centre_maxes[i]), axis=1)
             box = candidates[keep]

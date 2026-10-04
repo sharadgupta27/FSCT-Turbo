@@ -4,11 +4,11 @@
 # desktop app (fsct_desktop.py) and the browser UI (fsct_web.py). There
 # used to be three files - requirements.txt, requirements_gui.txt and
 # requirements_wrapper.txt - plus a fourth hardcoded list inside
-# FSCT.bat, which is how requirements.txt came to pin numpy<2.2 and
+# FSCT-Turbo.bat, which is how requirements.txt came to pin numpy<2.2 and
 # pandas<3.0 while the installer was actually producing numpy 2.4 and
 # pandas 3.0.
 #
-# The recommended install is FSCT.bat, which builds the 'lidar' conda
+# The recommended install is FSCT-Turbo.bat, which builds the 'lidar' conda
 # environment. It installs the binary-heavy packages from conda-forge and
 # PyTorch from the PyTorch wheel index, then runs `pip install -r` on this
 # file to pick up whatever is left. Every lower bound below is chosen to be
@@ -45,7 +45,7 @@ torch-cluster==1.6.3
 
 # --- scientific stack ------------------------------------------------
 #
-# Prefer the conda-forge builds of these. FSCT.bat installs them with
+# Prefer the conda-forge builds of these. FSCT-Turbo.bat installs them with
 # libblas=*=*openblas, because MKL 2026.1.0 fails to resolve a
 # delay-loaded export on Windows and numpy.linalg.svd / lstsq then kill
 # the process with 0xC06D007F and no traceback - which takes out cylinder
@@ -80,7 +80,9 @@ customtkinter>=5.2.0
 # --- browser UI (fsct_web.py) ----------------------------------------
 # statsmodels enables the OLS trendline on the DBH-vs-Height scatter;
 # visualization_utils.py falls back to a plain scatter without it.
-streamlit>=1.35
+# fsct_web.py passes download buttons a callable, so a point cloud is read
+# from disk only when its download is clicked; verified on 1.61.
+streamlit>=1.61
 plotly>=5.20
 pydeck>=0.9
 statsmodels>=0.14

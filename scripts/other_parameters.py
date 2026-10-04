@@ -5,11 +5,10 @@
 
 other_parameters = dict(
     model_filename="model.pth",
-    use_amp=True,  # Run semantic segmentation in fp16 on the GPU. Roughly halves both the runtime and the
-    # activation memory. Shifts ~0.17% of point labels (points where the top two classes were near-tied);
-    # for comparison, the unseeded randomness below used to move ~8.76% between runs. Ignored on CPU.
-    # Caveat: fp16 reductions are not bit-deterministic, so even with random_seed set two runs can differ
-    # on a handful of points (measured: 2 in 673,517). Set use_amp=False for exactly repeatable output.
+    use_amp=False,  # Off: segmentation runs in fp32 and repeat runs are bit-identical. True runs it in fp16
+    # (with TF32) on the GPU: about 15% faster on segmentation and half the activation memory, useful on a
+    # small card, but not exact - fp16 reductions are not bit-reproducible (2 labels in 673,517 differed
+    # between identical runs) and about 0.17% of labels differ from fp32. Ignored on CPU.
     prewarm_worker_pool=True,  # Start the measurement stage's worker processes while the GPU is busy with
     # segmentation, so their start-up (importing numpy/scipy/sklearn/hdbscan, several seconds per worker on
     # Windows) is hidden behind it rather than paid at the start of measurement. Costs roughly 100 MB of RAM

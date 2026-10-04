@@ -12,14 +12,14 @@ REM               and LAStools. No questions asked.
 REM  Later runs : asks only what you want to launch.
 REM
 REM  Advanced (not shown in the menu):
-REM      FSCT.bat gui          launch the desktop app
-REM      FSCT.bat web          launch the browser UI
-REM      FSCT.bat setup        re-run setup, keeping the environment
-REM      FSCT.bat setup /force rebuild the environment from scratch
-REM      FSCT.bat verify       run the installation checks
-REM      FSCT.bat lastools     re-download LAStools
-REM      FSCT.bat version      print the version and exit
-REM      FSCT.bat help         command list
+REM      FSCT-Turbo.bat gui          launch the desktop app
+REM      FSCT-Turbo.bat web          launch the browser UI
+REM      FSCT-Turbo.bat setup        re-run setup, keeping the environment
+REM      FSCT-Turbo.bat setup /force rebuild the environment from scratch
+REM      FSCT-Turbo.bat verify       run the installation checks
+REM      FSCT-Turbo.bat lastools     re-download LAStools
+REM      FSCT-Turbo.bat version      print the version and exit
+REM      FSCT-Turbo.bat help         command list
 REM
 REM  Version matrix (pinned - the torch / torch-geometric /
 REM  torch-cluster triple must agree or the model will not load):
@@ -265,7 +265,7 @@ if errorlevel 1 (
     echo   Setup finished WITH PROBLEMS
     echo ========================================
     echo.
-    echo Some checks failed. Run 'FSCT.bat setup /force' to rebuild
+    echo Some checks failed. Run 'FSCT-Turbo.bat setup /force' to rebuild
     echo the environment from scratch.
     goto fail
 )
@@ -332,7 +332,7 @@ popd
 if not "!EXITCODE!"=="0" (
     echo.
     echo ERROR: The application exited with code !EXITCODE!.
-    echo If you see missing-module errors, run:  FSCT.bat setup /force
+    echo If you see missing-module errors, run:  FSCT-Turbo.bat setup /force
     goto fail
 )
 exit /b 0
@@ -391,15 +391,15 @@ goto done
 echo.
 echo FSCT - Forest Structural Complexity Tool  v%APP_VERSION%
 echo.
-echo   FSCT.bat                  set up if needed, then choose what to launch
-echo   FSCT.bat gui              launch the desktop app
-echo   FSCT.bat web              launch the browser UI
-echo   FSCT.bat setup            re-run setup, keeping the environment
-echo   FSCT.bat setup /force     rebuild the environment from scratch
-echo   FSCT.bat verify           run the installation checks
-echo   FSCT.bat lastools         re-download LAStools
-echo   FSCT.bat version          print the version and exit
-echo   FSCT.bat help             this list
+echo   FSCT-Turbo.bat                  set up if needed, then choose what to launch
+echo   FSCT-Turbo.bat gui              launch the desktop app
+echo   FSCT-Turbo.bat web              launch the browser UI
+echo   FSCT-Turbo.bat setup            re-run setup, keeping the environment
+echo   FSCT-Turbo.bat setup /force     rebuild the environment from scratch
+echo   FSCT-Turbo.bat verify           run the installation checks
+echo   FSCT-Turbo.bat lastools         re-download LAStools
+echo   FSCT-Turbo.bat version          print the version and exit
+echo   FSCT-Turbo.bat help             this list
 echo.
 echo See USAGE.md for details.
 goto done

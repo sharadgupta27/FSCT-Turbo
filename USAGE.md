@@ -1,20 +1,22 @@
-# Installing and running FSCT
+# Installing and running FSCT-Turbo
 
-This is the complete guide to installing FSCT and running it. For what the tool
-does, what it outputs and what the parameters mean, see [README.md](README.md).
+This is the complete guide to installing FSCT-Turbo and running it. For what
+FSCT-Turbo adds over the original FSCT, see [README.md](README.md). For what FSCT
+measures, what its output files contain and what each inherited parameter means,
+see the [original FSCT README](https://github.com/SKrisanski/FSCT#readme).
 For what changed between releases, see [CHANGELOG.md](CHANGELOG.md).
 
-Check which version you have with `FSCT.bat version`.
+Check which version you have with `FSCT-Turbo.bat version`.
 
 ---
 
 ## TL;DR
 
 1. Install [Miniforge](https://github.com/conda-forge/miniforge/releases/latest).
-2. Double-click **`FSCT.bat`**.
+2. Double-click **`FSCT-Turbo.bat`**.
 
-That's it. The first run installs everything by itself — conda environment,
-PyTorch, both interfaces and LAStools — and asks nothing. It takes 15-25 minutes
+That's it. The first run installs everything by itself: conda environment,
+PyTorch, both interfaces and LAStools, and asks nothing. It takes 15-25 minutes
 and needs about 6 GB. Every run after that just asks what you want to launch:
 
 ```text
@@ -27,25 +29,25 @@ and needs about 6 GB. Every run after that just asks what you want to launch:
 
 ## 1. Installation
 
-### FSCT.bat
+### FSCT-Turbo.bat
 
-`FSCT.bat` is the only batch file. Normally you just double-click it, but it also
+`FSCT-Turbo.bat` is the only batch file. Normally you just double-click it, but it also
 takes commands:
 
 | Command | What it does |
 |---|---|
-| `FSCT.bat` | Set up if needed, then choose what to launch |
-| `FSCT.bat gui` | Launch the desktop app directly |
-| `FSCT.bat web` | Launch the browser UI directly |
-| `FSCT.bat setup` | Re-run setup, keeping the environment |
-| `FSCT.bat setup /force` | Rebuild the environment from scratch |
-| `FSCT.bat verify` | Run the installation checks |
-| `FSCT.bat lastools` | Re-download LAStools |
-| `FSCT.bat help` | Command list |
+| `FSCT-Turbo.bat` | Set up if needed, then choose what to launch |
+| `FSCT-Turbo.bat gui` | Launch the desktop app directly |
+| `FSCT-Turbo.bat web` | Launch the browser UI directly |
+| `FSCT-Turbo.bat setup` | Re-run setup, keeping the environment |
+| `FSCT-Turbo.bat setup /force` | Rebuild the environment from scratch |
+| `FSCT-Turbo.bat verify` | Run the installation checks |
+| `FSCT-Turbo.bat lastools` | Re-download LAStools |
+| `FSCT-Turbo.bat help` | Command list |
 
 Setup completion is recorded in a `.fsct_setup` stamp file next to the script.
 Delete it to force setup to run again on the next launch. The stamp also carries
-a version number, so bumping the package set in `FSCT.bat` makes existing
+a version number, so bumping the package set in `FSCT-Turbo.bat` makes existing
 installs refresh themselves automatically.
 
 Both interfaces share the **same** `lidar` conda environment.
@@ -87,7 +89,7 @@ the whole class of problem.
 
 ### Manual installation
 
-If you would rather not use `FSCT.bat`:
+If you would rather not use `FSCT-Turbo.bat`:
 
 ```bat
 conda create -n lidar python=3.11 pip -y -c conda-forge
@@ -117,14 +119,14 @@ conda run -n lidar --no-capture-output python test_installation.py
 
 Replace `cu121` with `cpu` in both URLs if you have no Nvidia GPU.
 
-`requirements.txt` is the single requirements file — core pipeline, desktop app
-and browser UI. `FSCT.bat` runs `pip install -r requirements.txt` as its final
+`requirements.txt` is the single requirements file: core pipeline, desktop app
+and browser UI. `FSCT-Turbo.bat` runs `pip install -r requirements.txt` as its final
 dependency step, so the same file that describes a plain-venv install is the one
 the supported installer exercises.
 
 Every version bound in it is deliberately open at the top. conda-forge and the
 PyTorch wheel index install newer builds than PyPI would resolve to, and a
-capped bound makes that final pip pass pull PyPI wheels over them — which is how
+capped bound makes that final pip pass pull PyPI wheels over them, which is how
 an earlier `numpy<2.2, pandas<3.0` pin would have downgraded a working
 environment. If you tighten a bound, check it with:
 
@@ -136,7 +138,7 @@ On a correctly built environment that must report nothing to install.
 
 ### LAStools
 
-`FSCT.bat setup` runs `setup_lastools.py`, which downloads the official
+`FSCT-Turbo.bat setup` runs `setup_lastools.py`, which downloads the official
 distribution (about 60 MB), unpacks it to `third_party/LAStools/` and writes the
 path to its `bin` directory into `gui_config.json`. Nothing needs to be set on
 the Settings page.
@@ -144,7 +146,7 @@ the Settings page.
 To (re)run it by hand:
 
 ```bat
-FSCT.bat lastools                                      :: re-download
+FSCT-Turbo.bat lastools                                      :: re-download
 conda run -n lidar python setup_lastools.py            :: install only if missing
 ```
 
@@ -160,12 +162,23 @@ and watermark their output without a licence key. See
 ### Verifying
 
 ```bat
-FSCT.bat verify
+FSCT-Turbo.bat verify
 ```
 
-This is the same check `FSCT.bat setup` runs at the end. It distinguishes "no GPU
+This is the same check `FSCT-Turbo.bat setup` runs at the end. It distinguishes "no GPU
 present" from "GPU present but a CPU-only PyTorch got installed", and it
 exercises the `torch-cluster` operators rather than just importing the package.
+
+To check the code rather than the installation, run the regression tests
+(about a minute). Setting `FSCT_E2E=1` adds a full run of the example plot,
+which checks its segmentation to the exact point count:
+
+```bat
+conda run -n lidar python -m unittest discover -s tests
+
+set FSCT_E2E=1
+conda run -n lidar python -m unittest discover -s tests
+```
 
 ### System requirements
 
@@ -184,11 +197,11 @@ Linux works; macOS is untested.
 ## 2. Running the desktop app
 
 ```bat
-FSCT.bat gui
+FSCT-Turbo.bat gui
 ```
 
 A sidebar on the left selects one of five pages. The file you are working on is
-named in the header, so it stays visible whichever page you are on — that
+named in the header, so it stays visible whichever page you are on; that
 header chip is read-only. Choosing a file happens in one place, the Point Cloud
 page; `Ctrl+O` jumps there and opens the picker.
 
@@ -202,7 +215,7 @@ Point count, density, extent, height range and file size appear as tiles, with
 the full header underneath.
 
 Only the header is read, so even a multi-gigabyte file opens instantly. If the
-header has no bounding box recorded — plenty of exporters leave it zeroed — the
+header has no bounding box recorded (plenty of exporters leave it zeroed), the
 real extent is measured from the points in the background, and the panel says
 so.
 
@@ -223,8 +236,8 @@ so.
   carries a stale `laszip encoded` record left behind by an earlier format
   conversion, describing a point layout the file no longer uses. LAStools
   trusts it and gives up; laspy ignores it, which is why FSCT processes such a
-  file without complaint. The clean copy keeps **every** point — it is a
-  repair, not a resample — and preserves the coordinates, intensity, GPS time,
+  file without complaint. The clean copy keeps **every** point (it is a
+  repair, not a resample) and preserves the coordinates, intensity, GPS time,
   classification, scales, offsets, version, point format and the
   georeferencing VLR.
 - The operation log shows timestamped status for everything done here.
@@ -235,21 +248,23 @@ Parameters on the left, a live processing console on the right. Each parameter
 has a slider and a typed value, so you can drag roughly or enter an exact
 number, and a one-line note explaining what it changes.
 
-**Compute** — batch size, CPU core count, force-CPU mode.
-**Plot** — plot radius, plot buffer, tree base height, ground veg height.
-**Measurement** — slice thickness, slice increment, height percentile, sort
+**Compute**: batch size, CPU core count, force-CPU mode.
+**Plot**: plot radius, plot buffer, tree base height, ground veg height.
+**Measurement**: slice thickness, slice increment, height percentile, sort
 stems, write the segmented output cloud.
 
-All of these are explained in [README.md](README.md#user-parameters). Start with
+All of these are explained in the [original FSCT
+README](https://github.com/SKrisanski/FSCT#user-parameters); the ones FSCT-Turbo
+adds are in [README.md](README.md#new-parameters). Start with
 the defaults; the suggested batch size is chosen from your GPU's memory.
 
 Press **Run FSCT analysis** and watch the console, which reports the current
 stage and elapsed time as it goes. **Save log...** writes the console to a text
 file. The app switches to Results when the run finishes.
 
-FSCT runs as one uninterruptible job, so **Stop** cannot cancel it once it has
-started — it says as much. To abort, close the window and delete the partial
-output folder.
+**Stop** ends the run, worker processes included, after asking you to confirm.
+The output folder is left incomplete; delete it or run again. Closing the
+window during a run stops it the same way.
 
 ### Results
 
@@ -260,8 +275,8 @@ the full plot summary as a table.
 
 Double-click a file in the list (or select it and press **Open selected**) to
 open it. Point clouds go to lasview, since Windows has no default association
-for `.las`/`.laz`; everything else — the report figures, CSVs and the HTML or
-markdown report — opens in whatever application you have associated with it.
+for `.las`/`.laz`; everything else (the report figures, CSVs and the HTML or
+markdown report) opens in whatever application you have associated with it.
 
 ### Settings
 
@@ -275,7 +290,7 @@ check when something fails to import.
 ## 3. Running the browser UI
 
 ```bat
-FSCT.bat web
+FSCT-Turbo.bat web
 ```
 
 It opens automatically at <http://localhost:8501>. If it doesn't, navigate there
@@ -288,7 +303,9 @@ conda run -n lidar streamlit run fsct_web.py --server.port 8502
 The workflow mirrors the desktop app: upload in **File Upload & Processing**,
 convert or resample in **File Operations**, set parameters in the sidebar and
 press **Run FSCT Inference**, then explore CSV tables, interactive plots and
-generated figures in **Results & Visualization**. Outputs can be downloaded
+generated figures in **Results & Visualization**. While a run is going, the
+Run tab shows the current stage and the latest output, and **Stop analysis**
+ends it; changing other settings meanwhile does not interrupt it. Outputs can be downloaded
 directly from the browser.
 
 ---
@@ -309,8 +326,8 @@ picker, replace the `file_mode()` call with `directory_mode()` (which finds ever
 name), or with a plain list of paths.
 
 Each of the five stages can be switched off independently in the `FSCT(...)`
-call — `preprocess`, `segmentation`, `postprocessing`, `measure_plot`,
-`make_report` — but each needs the previous one to have been run already. This is
+call (`preprocess`, `segmentation`, `postprocessing`, `measure_plot`,
+`make_report`), but each needs the previous one to have been run already. This is
 useful when iterating: run preprocessing and segmentation once, then re-run just
 the measurement stage.
 
@@ -323,7 +340,11 @@ conda run -n lidar python batch_process.py <input_directory> --combine-only
 conda run -n lidar python batch_process.py <input_directory> --config my_params.json
 ```
 
-Results from every plot are combined into a single timestamped CSV.
+Results from every plot are combined into a single timestamped CSV. Parameters
+come from `wrapper_config.json` beside `batch_process.py`, or the file given
+with `--config`; any parameter a config leaves out takes its default. The exit
+code is 0 when every file succeeded, 1 when any failed and 2 for a misspelt
+parameter in the config, so a script or scheduled task can check it.
 
 ### Combining results from earlier runs
 
@@ -357,17 +378,20 @@ Noisy data above the canopy: set height percentile to 98.
 
 ### By hardware
 
-- **With a GPU** — keep the defaults. The app picks a batch size from the
+- **With a GPU**: keep the defaults. The app picks a batch size from the
   detected VRAM; raising it beyond that is usually slower, not faster.
-- **CPU only** — tick "Use CPU Only" and drop the batch size to 1. Expect
-  inference to take considerably longer.
-- **Limited RAM** — reduce the CPU core count and resample the cloud first.
+- **CPU only**: tick "Use CPU Only" and drop the batch size to 1. Expect
+  inference to take considerably longer. The results are the same as on a GPU
+  apart from floating-point rounding: on the example plot 84 of 673,517 labels
+  differ, and the four trees get identical DBH and height. The batch size never
+  changes the results, only the speed.
+- **Limited RAM**: reduce the CPU core count and resample the cloud first.
 
 ### Where the parameters live
 
 - The two UIs expose the common ones directly.
 - `scripts/run.py` holds them for command-line use.
-- `scripts/other_parameters.py` holds the advanced ones — segmentation box
+- `scripts/other_parameters.py` holds the advanced ones: segmentation box
   geometry, clustering thresholds, the random seed, and the two knobs that
   control cylinder fitting cost (`circle_fit_trials` and
   `circle_fit_max_points`).
@@ -376,13 +400,8 @@ Noisy data above the canopy: set height percentile to 98.
 
 ## 6. Example data
 
-Test files ship with the project:
-
-- `data/test/example.las`
-- `data/train/example.las`
-- `data/validation/example.las`
-
-A complete run of `data/test/example.las` takes well under a minute on a laptop
+One test file ships with the project: `data/test/example.las`, the example
+plot from the original FSCT. A complete run of `data/test/example.las` takes well under a minute on a laptop
 RTX 3050.
 
 ---
@@ -390,16 +409,16 @@ RTX 3050.
 ## 7. Troubleshooting
 
 **"Failed to create environment" / solver conflicts**
-Run `FSCT.bat setup /force`. A part-built environment from an earlier failed run
+Run `FSCT-Turbo.bat setup /force`. A part-built environment from an earlier failed run
 cannot reliably be repaired in place.
 
 **`ModuleNotFoundError` for `torch_geometric`, `mdutils`, `community` or `markdown`**
 A previous install failed part-way and reported success anyway. Run
-`FSCT.bat setup /force`.
+`FSCT-Turbo.bat setup /force`.
 
 **`torch.cuda.is_available()` is False on a machine with an Nvidia GPU**
 A CPU-only build got installed. Recreate the environment with
-`FSCT.bat setup /force`.
+`FSCT-Turbo.bat setup /force`.
 
 **The process dies during cylinder fitting with `0xC06D007F` and no traceback**
 An MKL build of numpy got in. Recreate the environment; setup forces OpenBLAS.
@@ -419,7 +438,7 @@ CA bundle. If it still fails, download LAStools manually and point the Settings
 page at its `bin` folder.
 
 **"lasview.exe not found"**
-LAStools isn't installed or isn't configured. Run `FSCT.bat lastools`, or install
+LAStools isn't installed or isn't configured. Run `FSCT-Turbo.bat lastools`, or install
 it from <https://rapidlasso.de/lastools/> and set the path on the Settings page.
 
 **`ValueError: substring not found` from `get_fsct_path`**
@@ -435,14 +454,15 @@ Fixed. `interpolation=` was renamed to `method=` in numpy 1.22 and removed in
 You have it open in Excel. Close it.
 
 **Processing seems stuck at "Starting multithreaded cylinder fitting"**
-It should not be any more — see the measurement-stage figures in
+It should not be any more; see the measurement-stage figures in
 [README.md](README.md#performance). If it still is, the plot is probably very
 large; lower `circle_fit_trials` in `scripts/other_parameters.py`.
 
-**No trees found / an error at the measurement stage**
-The tree measurement code errors out if it finds no trees. Check
-`segmented.las` in a viewer — if the stems came out labelled as vegetation, the
-cloud is likely too low resolution for the segmentation model.
+**No trees found**
+A plot with no trees completes normally: `tree_data.csv` is empty, the plot
+summary reports 0 trees and the report says "No stems found". If you expected
+trees, check `segmented.las` in a viewer; if the stems came out labelled as
+vegetation, the cloud is likely too low resolution for the segmentation model.
 
 ---
 
@@ -450,4 +470,4 @@ cloud is likely too low resolution for the segmentation model.
 
 - Upstream project and issues: https://github.com/SKrisanski/FSCT
 - Example files in `data/`
-- `FSCT.bat verify` for a quick health check of the installation
+- `FSCT-Turbo.bat verify` for a quick health check of the installation

@@ -4,10 +4,14 @@ A user-friendly web interface for the Forest Structural Complexity Tool (FSCT)
 """
 
 import streamlit as st
+import collections
+import functools
 import os
 import sys
 import subprocess
 import tempfile
+import threading
+import time
 import shutil
 import pandas as pd
 import numpy as np
@@ -22,8 +26,7 @@ for _path in (os.path.join(PROJECT_ROOT, 'scripts'), PROJECT_ROOT):
         sys.path.insert(0, _path)
 
 from version import __version__
-from scripts.run_tools import FSCT
-from scripts.other_parameters import other_parameters
+import fsct_job
 
 try:
     from setup_lastools import ensure_lastools, find_lastools_bin
@@ -208,50 +211,132 @@ class FSCTWrapper:
         subprocess.Popen([lasview_exe, las_file])
     
     def get_point_cloud_info(self, las_file):
-        """Get basic information about a point cloud"""
+        """Get basic information about a point cloud, from its header alone."""
+        # laspy.read() loaded every point to report what the header already
+        # says - minutes and gigabytes for a large cloud, on every page rerun.
         try:
             import laspy
-            las = laspy.read(las_file)
-            
-            info = {
-                'num_points': len(las.points),
-                'min_x': float(las.header.x_min),
-                'max_x': float(las.header.x_max),
-                'min_y': float(las.header.y_min),
-                'max_y': float(las.header.y_max),
-                'min_z': float(las.header.z_min),
-                'max_z': float(las.header.z_max),
-                'point_format': las.point_format.id,
-                'version': f"{las.header.version.major}.{las.header.version.minor}"
-            }
-            return info
+            with laspy.open(las_file) as reader:
+                header = reader.header
+                mins, maxs = header.mins, header.maxs
+                return {
+                    'num_points': int(header.point_count),
+                    'min_x': float(mins[0]),
+                    'max_x': float(maxs[0]),
+                    'min_y': float(mins[1]),
+                    'max_y': float(maxs[1]),
+                    'min_z': float(mins[2]),
+                    'max_z': float(maxs[2]),
+                    'point_format': header.point_format.id,
+                    'version': f"{header.version.major}.{header.version.minor}"
+                }
         except Exception as e:
             return {'error': str(e)}
-    
-    def run_fsct_inference(self, point_cloud_file, parameters):
-        """Run FSCT inference on a point cloud"""
-        try:
-            # Update parameters with file
-            parameters['point_cloud_filename'] = point_cloud_file
-            
-            # Run FSCT
-            FSCT(
-                parameters=parameters,
-                preprocess=True,
-                segmentation=True,
-                postprocessing=True,
-                measure_plot=True,
-                make_report=True,
-                clean_up_files=False
-            )
-            
-            # Get output directory
-            output_dir = point_cloud_file.replace('\\', '/')[:-4] + "_FSCT_output/"
-            
-            return output_dir
-            
-        except Exception as e:
-            raise Exception(f"FSCT inference failed: {str(e)}")
+
+
+def _read_file(path):
+    with open(path, 'rb') as f:
+        return f.read()
+
+
+def deferred_download(path):
+    """
+    Download-button data for `path`, read only when the button is clicked.
+
+    Passing the bytes read the whole file into memory on every page rerun,
+    whether or not anyone downloaded it - for a point cloud, hundreds of MB
+    per click anywhere on the page.
+    """
+    return functools.partial(_read_file, path)
+
+
+class WebJob:
+    """
+    An FSCT run started from the browser, held in st.session_state.
+
+    The run is an fsct_job child process with a reader thread collecting its
+    output, so it outlives the script run that started it. Streamlit reruns
+    the script on every widget interaction; a run tied to the script would
+    either block the page until FSCT finished or be killed by the first
+    slider touch. Only Stop ends this one.
+    """
+
+    def __init__(self, parameters):
+        self.output_dir = fsct_job.output_dir_for(parameters['point_cloud_filename'])
+        self._lock = threading.Lock()  # the reader appends while the page reads
+        self.lines = collections.deque(maxlen=400)
+        self.progress_line = ""
+        self.stage = "Starting"
+        self.failure = None
+        self.stopped = False
+        self.started = time.time()
+        self.finished = None
+        self.returncode = None
+        self.process = fsct_job.start(parameters)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for text, transient in fsct_job.lines(self.process):
+            if transient:
+                self.progress_line = text
+                continue
+            self.progress_line = ""
+            with self._lock:
+                self.lines.append(text)
+            if text.startswith(fsct_job.FAILURE_PREFIX):
+                self.failure = text[len(fsct_job.FAILURE_PREFIX):]
+            self.stage = fsct_job.stage_for(text) or self.stage
+        self.returncode = self.process.returncode
+        self.finished = time.time()
+
+    def tail(self, count):
+        with self._lock:
+            return list(self.lines)[-count:]
+
+    @property
+    def running(self):
+        return self.finished is None
+
+    @property
+    def succeeded(self):
+        return self.returncode == 0 and not self.stopped
+
+    def stop(self):
+        self.stopped = True
+        threading.Thread(target=fsct_job.stop, args=(self.process,), daemon=True).start()
+
+
+# The stages a run passes through, in order, for the progress bar.
+_STAGES = list(dict.fromkeys(stage for _, stage in fsct_job.STAGE_MARKERS))
+
+
+def show_job(job):
+    """Status, progress, recent output and a Stop button for a WebJob."""
+    elapsed = (job.finished or time.time()) - job.started
+    minutes, seconds = divmod(int(elapsed), 60)
+
+    if job.running and job.stopped:
+        st.info("Stopping the analysis...")
+    elif job.running:
+        done = _STAGES.index(job.stage) + 1 if job.stage in _STAGES else 0
+        st.progress(done / (len(_STAGES) + 1), text=f"{job.stage}  ({minutes}:{seconds:02d})")
+        if st.button("⏹ Stop analysis", key="stop_job"):
+            job.stop()
+            st.rerun()
+    elif job.stopped:
+        st.warning(f"Analysis stopped after {minutes}:{seconds:02d}. "
+                   f"Its output folder is incomplete and can be deleted: {job.output_dir}")
+    elif job.succeeded:
+        st.success(f"✅ FSCT processing complete in {minutes}:{seconds:02d}. "
+                   f"Output saved to: {job.output_dir}")
+    else:
+        st.error(f"❌ FSCT failed: {job.failure or f'the process exited with code {job.returncode}'}")
+
+    tail = job.tail(14)
+    if job.progress_line:
+        tail.append(job.progress_line)
+    if tail:
+        st.code("\n".join(tail), language=None)
 
 
 def main():
@@ -274,7 +359,7 @@ def main():
     if 'wrapper' not in st.session_state:
         st.session_state.wrapper = FSCTWrapper()
     if 'lastools_path' not in st.session_state:
-        # Pick up the copy that FSCT.bat / setup_lastools.py unpacked,
+        # Pick up the copy that FSCT-Turbo.bat / setup_lastools.py unpacked,
         # so the user does not have to paste a path in by hand.
         detected = find_lastools_bin() if LASTOOLS_SETUP_AVAILABLE else None
         st.session_state.lastools_path = detected
@@ -286,7 +371,11 @@ def main():
         st.session_state.processed_file_path = None
     if 'output_dir' not in st.session_state:
         st.session_state.output_dir = None
-    
+    if 'job' not in st.session_state:
+        st.session_state.job = None  # the current or last WebJob
+    if 'upload_key' not in st.session_state:
+        st.session_state.upload_key = None  # which upload is already on disk
+
     # Sidebar configuration
     with st.sidebar:
         st.header("⚙️ Configuration")
@@ -301,7 +390,7 @@ def main():
         lastools_path = st.text_input(
             "Path to the LAStools 'bin' directory:",
             value=st.session_state.lastools_path or "",
-            help="Normally filled in automatically by FSCT.bat"
+            help="Normally filled in automatically by FSCT-Turbo.bat"
         )
 
         if st.button("Set LAStools Path"):
@@ -370,21 +459,27 @@ def main():
         )
         
         if uploaded_file is not None:
-            # Save uploaded file
-            file_ext = os.path.splitext(uploaded_file.name)[1]
-            temp_file_path = os.path.join(
-                st.session_state.wrapper.temp_dir,
-                f"uploaded_{datetime.now().strftime('%Y%m%d_%H%M%S')}{file_ext}"
-            )
-            
-            with open(temp_file_path, 'wb') as f:
-                f.write(uploaded_file.getbuffer())
-            
-            st.session_state.uploaded_file_path = temp_file_path
-            st.session_state.processed_file_path = temp_file_path
-            
+            # Save each upload once. This block runs on every rerun while the
+            # uploader holds a file, and used to write a fresh timestamped
+            # copy and reset processed_file_path each time - so a conversion
+            # or resample was silently replaced by the raw upload on the very
+            # next rerun, and every rerun added another full copy on disk.
+            upload_key = (uploaded_file.file_id, uploaded_file.name, uploaded_file.size)
+            if st.session_state.upload_key != upload_key:
+                file_ext = os.path.splitext(uploaded_file.name)[1]
+                temp_file_path = os.path.join(
+                    st.session_state.wrapper.temp_dir,
+                    f"uploaded_{datetime.now().strftime('%Y%m%d_%H%M%S')}{file_ext}"
+                )
+                with open(temp_file_path, 'wb') as f:
+                    f.write(uploaded_file.getbuffer())
+                st.session_state.upload_key = upload_key
+                st.session_state.uploaded_file_path = temp_file_path
+                st.session_state.processed_file_path = temp_file_path
+            temp_file_path = st.session_state.uploaded_file_path
+
             st.success(f"✅ File uploaded: {uploaded_file.name}")
-            
+
             # Show file info
             with st.spinner("Reading point cloud information..."):
                 info = st.session_state.wrapper.get_point_cloud_info(temp_file_path)
@@ -461,8 +556,10 @@ def main():
                 if st.button("Resample Point Cloud", use_container_width=True):
                     with st.spinner("Resampling..."):
                         try:
-                            file_ext = os.path.splitext(current_file)[1]
-                            output_file = current_file.replace(file_ext, f'_resampled{file_ext}')
+                            # splitext, not replace: replace rewrote every
+                            # ".las" in the path, directory names included.
+                            stem, file_ext = os.path.splitext(current_file)
+                            output_file = f"{stem}_resampled{file_ext}"
                             st.session_state.wrapper.resample_point_cloud(
                                 current_file, output_file, step_size
                             )
@@ -476,12 +573,9 @@ def main():
             with col3:
                 st.subheader("Download")
                 if os.path.exists(current_file):
-                    with open(current_file, 'rb') as f:
-                        file_data = f.read()
-                    
                     st.download_button(
                         label="Download Current File",
-                        data=file_data,
+                        data=deferred_download(current_file),
                         file_name=os.path.basename(current_file),
                         mime="application/octet-stream",
                         use_container_width=True
@@ -495,81 +589,62 @@ def main():
             st.warning("⚠️ Please upload a file first.")
         else:
             current_file = st.session_state.processed_file_path
-            
-            # Make sure it's a .las file
-            if current_file.lower().endswith('.laz'):
-                st.info("Converting LAZ to LAS for processing...")
+            job = st.session_state.job
+            running = job is not None and job.running
+
+            # FSCT reads LAS only. A LAZ file is decompressed when the run
+            # starts - not on every rerun, which used to undo "Convert to LAZ"
+            # the moment that button's rerun reached this tab.
+            run_file = os.path.splitext(current_file)[0] + '.las' \
+                if current_file.lower().endswith('.laz') else current_file
+            st.info(f"📁 Processing file: {os.path.basename(run_file)}"
+                    + (" (decompressed from LAZ when the run starts)" if run_file != current_file else ""))
+
+            parameters = fsct_job.job_parameters(
+                point_cloud_filename=run_file,
+                plot_radius=plot_radius,
+                plot_radius_buffer=plot_radius_buffer,
+                batch_size=batch_size,
+                num_cpu_cores=num_cpu_cores if num_cpu_cores > 0 else os.cpu_count(),
+                use_CPU_only=use_cpu_only,
+                slice_thickness=slice_thickness,
+                slice_increment=slice_increment,
+                sort_stems=1 if sort_stems else 0,
+                height_percentile=height_percentile,
+                tree_base_cutoff_height=tree_base_cutoff_height,
+                generate_output_point_cloud=1 if generate_output_point_cloud else 0,
+                ground_veg_cutoff_height=ground_veg_cutoff_height,
+            )
+
+            with st.expander("View All Parameters"):
+                st.json(parameters)
+
+            if st.button("🚀 Run FSCT Inference", type="primary", use_container_width=True,
+                         disabled=running):
                 try:
-                    # splitext, not replace: replace would also rewrite any
-                    # ".laz" occurring in the directory part of the path.
-                    las_file = os.path.splitext(current_file)[0] + '.las'
-                    st.session_state.wrapper.convert_laz_to_las(current_file, las_file)
-                    current_file = las_file
-                    st.session_state.processed_file_path = las_file
+                    if run_file != current_file:
+                        with st.spinner("Converting LAZ to LAS..."):
+                            st.session_state.wrapper.convert_laz_to_las(current_file, run_file)
+                        st.session_state.processed_file_path = run_file
+                    st.session_state.job = WebJob(parameters)
+                    st.rerun()
                 except Exception as e:
-                    st.error(f"❌ Error converting to LAS: {str(e)}")
-                    current_file = None
-            
-            if current_file:
-                st.info(f"📁 Processing file: {os.path.basename(current_file)}")
-                
-                # Compile parameters
-                parameters = {
-                    'point_cloud_filename': current_file,
-                    'plot_centre': None,
-                    'plot_radius': plot_radius,
-                    'plot_radius_buffer': plot_radius_buffer,
-                    'batch_size': batch_size,
-                    'num_cpu_cores': num_cpu_cores if num_cpu_cores > 0 else os.cpu_count(),
-                    'use_CPU_only': use_cpu_only,
-                    'slice_thickness': slice_thickness,
-                    'slice_increment': slice_increment,
-                    'sort_stems': 1 if sort_stems else 0,
-                    'height_percentile': height_percentile,
-                    'tree_base_cutoff_height': tree_base_cutoff_height,
-                    'generate_output_point_cloud': 1 if generate_output_point_cloud else 0,
-                    'ground_veg_cutoff_height': ground_veg_cutoff_height,
-                    'veg_sorting_range': 1.5,
-                    'stem_sorting_range': 1,
-                    'taper_measurement_height_min': 0,
-                    'taper_measurement_height_max': 30,
-                    'taper_measurement_height_increment': 0.2,
-                    'taper_slice_thickness': 0.4,
-                    'delete_working_directory': True,
-                    'minimise_output_size_mode': 0,
-                }
-                
-                # Update with other_parameters
-                parameters.update(other_parameters)
-                
-                # Display parameters
-                with st.expander("View All Parameters"):
-                    st.json(parameters)
-                
-                if st.button("🚀 Run FSCT Inference", type="primary", use_container_width=True):
-                    with st.spinner("Running FSCT... This may take several minutes..."):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        try:
-                            status_text.text("Starting preprocessing...")
-                            progress_bar.progress(10)
-                            
-                            # Run FSCT
-                            output_dir = st.session_state.wrapper.run_fsct_inference(
-                                current_file, parameters
-                            )
-                            
-                            progress_bar.progress(100)
-                            status_text.text("Processing complete!")
-                            
-                            st.session_state.output_dir = output_dir
-                            st.success(f"✅ FSCT processing complete! Output saved to: {output_dir}")
-                            st.balloons()
-                            
-                        except Exception as e:
-                            st.error(f"❌ Error during inference: {str(e)}")
-                            st.exception(e)
+                    st.error(f"❌ Could not start FSCT: {str(e)}")
+
+            if job is not None:
+                # Redrawn once a second while the run is going. When it ends,
+                # rerun the whole page once so the Results tab picks it up.
+                @st.fragment(run_every=1.0 if running else None)
+                def job_panel():
+                    current = st.session_state.job
+                    show_job(current)
+                    if not current.running and st.session_state.get('job_shown_done') is not current:
+                        st.session_state.job_shown_done = current
+                        if current.succeeded:
+                            st.session_state.output_dir = current.output_dir
+                        st.rerun()
+
+                job_panel()
     
     # Tab 4: Results & Visualization
     with tab4:
@@ -653,13 +728,9 @@ def main():
                                     st.error("❌ Please set LAStools path in the sidebar first.")
                         
                         with col2:
-                            # Download button
-                            with open(selected_las, 'rb') as f:
-                                las_data = f.read()
-                            
                             st.download_button(
                                 label="Download Point Cloud",
-                                data=las_data,
+                                data=deferred_download(selected_las),
                                 file_name=os.path.basename(selected_las),
                                 mime="application/octet-stream",
                                 use_container_width=True
@@ -674,29 +745,23 @@ def main():
                         
                         try:
                             plot_summary = pd.read_csv(plot_summary_file)
-                            
-                            # Display key metrics
-                            col1, col2, col3, col4 = st.columns(4)
-                            
-                            if 'Number of Trees' in plot_summary.columns:
-                                with col1:
-                                    st.metric("Trees Detected", 
-                                            int(plot_summary['Number of Trees'].values[0]))
-                            
-                            if 'Mean Tree Height' in plot_summary.columns:
-                                with col2:
-                                    st.metric("Mean Tree Height (m)", 
-                                            f"{plot_summary['Mean Tree Height'].values[0]:.2f}")
-                            
-                            if 'Mean DBH' in plot_summary.columns:
-                                with col3:
-                                    st.metric("Mean DBH (cm)", 
-                                            f"{plot_summary['Mean DBH'].values[0]:.2f}")
-                            
-                            if 'Total Basal Area' in plot_summary.columns:
-                                with col4:
-                                    st.metric("Total Basal Area", 
-                                            f"{plot_summary['Total Basal Area'].values[0]:.2f}")
+
+                            # The columns FSCT actually writes, as on the
+                            # desktop Results page. This used to look for
+                            # 'Number of Trees', 'Mean Tree Height' and 'Total
+                            # Basal Area', which FSCT never emits, so only Mean
+                            # DBH ever showed - in metres, labelled cm.
+                            metrics = [
+                                ('Num Trees in Plot', 'Trees detected', '{:,.0f}'),
+                                ('Stems/ha', 'Stems per hectare', '{:,.0f}'),
+                                ('Mean DBH', 'Mean DBH (m)', '{:.3f}'),
+                                ('Mean Height', 'Mean height (m)', '{:.1f}'),
+                                ('Total Volume 1', 'Stem volume (m³)', '{:.2f}'),
+                            ]
+                            for column, (key, label, fmt) in zip(st.columns(len(metrics)), metrics):
+                                if key in plot_summary.columns and not pd.isna(plot_summary[key].values[0]):
+                                    with column:
+                                        st.metric(label, fmt.format(plot_summary[key].values[0]))
                         
                         except Exception as e:
                             st.error(f"Error reading plot summary: {str(e)}")

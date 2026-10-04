@@ -1,582 +1,349 @@
-# Forest Structural Complexity Tool
+# FSCT-Turbo
 
-### Created by Sean Krisanski
-![banner.png](readme_images/banner.png)
+A faster, reproducible build of the **Forest Structural Complexity Tool
+(FSCT)**, with a desktop application, a browser UI and a one-click Windows
+installer.
 
-Automatic plot-scale measurement of forest point clouds. Feed it a `.las` file
-and it segments the cloud into terrain, vegetation, coarse woody debris and
-stems, builds a terrain model, fits cylinders to the stems and writes out per-tree
-measurements: DBH, height, volume, taper and crown position.
+> **FSCT-Turbo is built on [FSCT](https://github.com/SKrisanski/FSCT) by Sean
+> Krisanski and colleagues** (University of Tasmania). The segmentation model,
+> its trained weights, the measurement method and the example data are their
+> work; see [Credits](#credits-and-acknowledgements).
+>
+> This README covers only what FSCT-Turbo adds. For what FSCT is, what it
+> measures and which sensors it suits, read the original README:
+> [purpose](https://github.com/SKrisanski/FSCT#purpose-of-this-tool),
+> [output files](https://github.com/SKrisanski/FSCT#fsct-outputs),
+> [parameters](https://github.com/SKrisanski/FSCT#user-parameters),
+> [known limitations](https://github.com/SKrisanski/FSCT#known-limitations) and
+> [training a new model](https://github.com/SKrisanski/FSCT#instructions-for-training-a-new-semantic-segmentation-model).
 
-**Video of the outputs: https://youtu.be/rej5Bu57AqM**
+![The example plot after one FSCT-Turbo run](readme_images/example_overview.png)
 
-> **To install and run it, see [USAGE.md](USAGE.md).** What changed between
-> releases is in [CHANGELOG.md](CHANGELOG.md). Those are the only other documents
-> in this project; everything else is in here.
+*The bundled example plot, `data/test/example.las`, after one FSCT-Turbo run
+with default settings, seen from the side: the input cloud, its semantic
+segmentation, the terrain model with the fitted stem circles, and the points
+assigned to each tree with its measured DBH and height.*
 
-## What this version adds
+**Version 1.0.0.** Version numbers count the original FSCT as version 0.
 
-This is upstream FSCT — <https://github.com/SKrisanski/FSCT>, by Sean Krisanski
-— with two user interfaces, an unattended installer and a substantially faster,
-reproducible processing chain wrapped around it. **The segmentation model and
-the measurement method are the original work.** Everything in this section is
-what differs from that repository.
+**Install and run:** install [Miniforge](https://github.com/conda-forge/miniforge/releases/latest),
+then double-click `FSCT-Turbo.bat`. The full guide is [USAGE.md](USAGE.md);
+release history is in [CHANGELOG.md](CHANGELOG.md).
 
-At a glance:
+## At a glance
 
-| | Original FSCT | This version |
-|---|---|---|
-| How you run it | Edit parameters at the top of `scripts/run.py`, execute it | Desktop app, browser UI, CLI or batch |
-| Installation | Assemble the conda environment yourself | `FSCT.bat` does it, asking nothing |
-| Repeat runs on one file | Disagree on ~10% of point labels | Deterministic at any CPU core count; exact in fp32, 2 labels in 673,517 with fp16 |
-| Circle fit (per slice) | 2737 ms | 28.6 ms — **96x** |
-| Cylinder fitting | 1739 ms/cylinder | 29 ms/cylinder — **60x** |
-| Preprocessing | 4.04 s | 0.70 s |
-| Segmentation | 24.1 s | 17.0 s |
-| Current libraries | Crashes on numpy 2.0 / pandas 3.0 / PyG 2.0 | Runs on all three |
+|                          | Original FSCT (version 0)                                    | FSCT-Turbo 1.0                                                     |
+| ------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------------ |
+| How you run it           | Edit parameters at the top of `scripts/run.py`, execute it   | Desktop app, browser UI, command line or unattended batch          |
+| Installation             | Assemble the conda environment yourself                      | `FSCT-Turbo.bat` does it, asking nothing                           |
+| Example plot, end to end | 330 s                                                        | 34.3 s, **9.6x faster**                                            |
+| Measurement stage        | 304 s                                                        | 13.8 s, **22x faster**                                             |
+| One circle fit           | 2,039 ms                                                     | 29.4 ms, **69x faster**                                            |
+| Repeat runs on one file  | 7 to 8% of point labels differ                               | Bit-identical, at any core count and batch size                    |
+| CPU-only machines        | Worse segmentation than on a GPU; seed has no effect         | The network sees the same neighbourhoods as on a GPU               |
+| Large clouds             | 5.1 million points: `MemoryError` on a 16 GB machine         | Completes in 156 s                                                 |
+| `Volume_1`               | Wrong frustum formula, radii halved twice                    | Corrected                                                          |
 
-Details: [User interfaces](#user-interfaces) · [Installation and
-tooling](#installation-and-tooling) · [Reproducibility](#reproducibility) ·
-[Performance](#performance) · [Correctness and compatibility
-fixes](#correctness-and-compatibility-fixes). Release history is in
-[CHANGELOG.md](CHANGELOG.md).
+## User interfaces
 
-### User interfaces
+Upstream has no interface: you edit `scripts/run.py` and run it. FSCT-Turbo
+adds two, both launched from `FSCT-Turbo.bat` and sharing one conda
+environment.
 
-Upstream has no interface: you edit `scripts/run.py` and run it.
+### Desktop application
 
-- **Desktop application** (`fsct_desktop.py`, `FSCT.bat gui`) — file picker,
-  point-cloud header inspection that reads the header only rather than loading
-  every point, parameter controls with hardware-aware defaults, a live
-  processing console, a results browser and a plot summary view.
-- **Browser UI** (`fsct_web.py`, `FSCT.bat web`) — the same pipeline as a
-  Streamlit app, adding an interactive 3D point cloud, height and DBH
-  distributions, a stem map and a DBH-height scatter (`visualization_utils.py`).
+`fsct_desktop.py`, or `FSCT-Turbo.bat gui`. Five pages, selected from the
+sidebar; the file you are working on stays in the header on every page.
 
-Both launch from the one `FSCT.bat` and share a single conda environment.
+**Point Cloud.** Pick a LAS or LAZ file. Only the header is read, so even a
+multi-gigabyte file shows its point count, density, extent, height range and
+coordinate offsets instantly.
 
-### Installation and tooling
+![Point Cloud page](readme_images/desktop_point_cloud.png)
 
-- **One-shot installation.** `FSCT.bat` builds the conda environment, installs a
-  matching PyTorch / PyTorch Geometric / torch-cluster triple, installs both
-  interfaces and downloads LAStools — without asking anything. Subcommands:
+**Tools.** LAZ/LAS conversion, resampling to a grid step, LAStools' 3D viewer,
+and a clean-copy repair for files whose headers other software rejects.
+
+![Tools page](readme_images/desktop_tools.png)
+
+**Analysis.** Every parameter with a slider, a typed field and a one-line
+explanation. The batch size defaults to what the detected GPU can hold, and the
+page says why. The console shows the pipeline's own output live, with the
+current stage and elapsed time above it.
+
+![Analysis page during a run](readme_images/desktop_analysis.png)
+
+**Results.** Trees detected, stems per hectare, mean DBH, mean height and stem
+volume from `plot_summary.csv`, above a browser of every output file. Files
+open in their associated application, LAS files in lasview, and the plot
+summary as a table.
+
+![Results page](readme_images/desktop_results.png)
+
+**Settings.** The LAStools path, a one-click LAStools download, light and dark
+appearance, and the Python, PyTorch and CUDA versions in use.
+
+![Settings page](readme_images/desktop_settings.png)
+
+### Browser UI
+
+`fsct_web.py`, or `FSCT-Turbo.bat web`. The same pipeline as a Streamlit app,
+adding an interactive 3D point cloud, height and DBH distributions, a stem map
+and a DBH-height scatter (`visualization_utils.py`). Outputs download straight
+from the browser.
+
+## Installation and tooling
+
+- **One-shot installation.** `FSCT-Turbo.bat` builds the conda environment,
+  installs a matching PyTorch, PyTorch Geometric and torch-cluster set, installs
+  both interfaces and downloads LAStools, without asking anything. Subcommands:
   `gui`, `web`, `setup`, `setup /force`, `verify`, `lastools`, `version`,
   `help`.
-- **Unattended batch processing** (`batch_process.py`) — process a directory
+- **Unattended batch processing** (`batch_process.py`): process a directory
   tree from the command line and combine the per-plot summaries into one CSV.
-  Upstream's directory mode opens a Tk folder dialog and cannot be scripted.
-- **LAStools integration** (`setup_lastools.py`) — downloaded and configured
+  Upstream's directory mode opens a folder dialog and cannot be scripted.
+- **LAStools integration** (`setup_lastools.py`): downloaded and configured
   automatically, with LAS/LAZ conversion, resampling and an external 3D viewer
-  wired into both interfaces.
-- **Installation self-test** (`test_installation.py`, `FSCT.bat verify`) —
-  checks the Python version, the deep-learning stack, the linear-algebra
-  routines, the point-cloud and reporting libraries, the core files, the FSCT
-  imports, and optional GPU / LAStools / UI components.
-- **Versioning** (`version.py`) — a single source of truth, shown in both
-  interfaces, the installation test, `FSCT.bat version` and
-  `batch_process.py --version`.
-
-### Correctness and compatibility fixes
-
-Fixed relative to upstream:
-
-- **Runs on current libraries.** `np.percentile(..., interpolation=)` was
-  removed in numpy 2.0 and crashed the measurement stage just before tree
-  heights were computed. `pandas.read_csv(delim_whitespace=)` was removed in
-  pandas 3.0. `DataLoader` moved out of `torch_geometric.data` in PyG 2.0.
-- **`get_fsct_path` only worked in a folder named exactly `FSCT`.** It truncated
-  `os.getcwd()` at the first "FSCT" substring, so any other folder name resolved
-  to a sibling directory that does not exist, and a path with no "FSCT" in it
-  raised `ValueError`. It is now derived from the module's own location.
-
-Reproduced on purpose, so measurements stay comparable with published work:
-
-- **Cylinder sorting emits one cylinder short.** The original loop stops with
-  the last cylinder still unsorted and never emits it. The rewritten sort keeps
-  that behaviour rather than silently changing every plot's cylinder count.
-- **CCI sectors are not evenly spaced.** See [Known
-  limitations](#known-limitations); `fix_cci_sectors` corrects it, off by
-  default.
-
-## Purpose of this tool
-
-This tool was written for the purpose of allowing plot scale measurements to be
-extracted automatically from most high-resolution forest point clouds from a
-variety of sensor sources. Such sensor types it works on include Terrestrial
-Laser Scanning (TLS), Mobile Laser Scanning (MLS), Terrestrial Photogrammetry,
-Above and below-canopy UAS Photogrammetry or similar. Very high resolution
-Aerial Laser Scanning (ALS) is typically on the borderline of what the
-segmentation tool is capable of handling at this time. If a dataset is too low
-resolution, the segmentation model will likely label the stems as vegetation
-points instead.
-
-There are also some instances where the segmentation model has not seen
-appropriate training data for the point cloud. This may be improved in future
-versions, as it should be easily fixed with additional training data.
-
-Start with small plots containing at least some trees. The tree measurement code
-will currently cause an error if it finds no trees in the point cloud.
-
-## FSCT Outputs
-
-Results land in a folder named `your_file_FSCT_output/`, next to the input file.
-
-### Tabular outputs
-
-`tree_data.csv` — basic measurements of the trees. All units are metres, or
-cubic metres for volume. Headings:
-
-```
-x_tree_base, y_tree_base, z_tree_base, DBH, CCI_at_BH, Height, Volume_1,
-Volume_2, Crown_mean_x, Crown_mean_y, Crown_top_x, Crown_top_y, Crown_top_z,
-mean_understory_height_in_5m_radius
-```
-
-* CCI_at_BH stands for Circumferential Completeness Index at Breast Height. CCI
-  is simply the fraction of a circle with point coverage in a stem slice, as
-  illustrated below. This provides an indication of how complete your stem
-  coverage is. In a single scan TLS point cloud, you cannot get a CCI greater
-  than 0.5 (assuming the cylinder fitting was not erroneous), as only one side
-  of the tree is mapped. If you have completely scanned the tree (at the
-  measurement location), you should get a CCI of 1.0.
-
-  ![CCI.jpg](readme_images/CCI.jpg)
-
-  The figure is from https://doi.org/10.3390/rs12101652 if you would like a more
-  detailed explanation of the idea.
-
-* Volume_1 is the sum of the volume of the fitted cylinders.
-* Volume_2 is the volume of a cone (with a base diameter equal to the DBH and
-  height from 1.3 m up to the tree height) + the volume of a cylinder (with a
-  diameter of DBH and 1.3 m tall). This avoids the possibility of a short and
-  shallow angled cone resulting from a short tree with a large DBH.
-
-`taper_data.csv` — the largest diameter at a range of given heights above the
-DTM for each stem, in metres. Headings are PlotId, TreeId, x_base, y_base,
-z_base, followed by the measurement heights.
-
-`plot_summary.csv` — summary information about the plot and the processing
-times. Be aware: if you open this while processing and FSCT attempts to write to
-the open file, it will throw a permission error.
-
-`cleaned_cyls.csv` — every fitted cylinder with its properties.
-
-`Plot_Report.html` and `Plot_Report.md` — a summary of the information
-extracted, nicer to look at than the processing report.
-
-![simple_outputs.png](readme_images/simple_outputs.png)
-
-### Point cloud outputs
-
-| File | Contents |
-|---|---|
-| `DTM.las` | Digital Terrain Model in point form |
-| `cropped_DTM.las` | DTM cropped to the plot radius |
-| `working_point_cloud.las` | Subsampled and cropped cloud fed to the segmentation tool |
-| `segmented.las` | Classified point cloud from the segmentation tool |
-| `segmented_cleaned.las` | Cleaned segmented cloud from the post-processing step |
-| `terrain_points.las` | Semantically segmented terrain points |
-| `vegetation_points.las` | Semantically segmented vegetation points |
-| `ground_veg.las` | Ground vegetation points |
-| `cwd_points.las` | Semantically segmented coarse woody debris points |
-| `stem_points.las` | Semantically segmented stem points |
-| `cleaned_cyls.las` | Point-based cylinder representation with a variety of properties |
-| `cleaned_cyl_vis.las` | Point cloud visualisation of the circles in `cleaned_cyls.las` |
-| `stem_points_sorted.las` | Stem points assigned by tree_id |
-| `veg_points_sorted.las` | Vegetation assigned by tree_id; ground points get tree_id 0 |
-| `text_point_cloud.las` | Point cloud text visualisation of TreeId, DBH, height, CCI at BH and volumes |
-| `tree_aware_cropped_point_cloud.las` | Cloud trimmed to plot_radius, if set. See Tree Aware Plot Cropping |
-
-**The two `*_sorted.las` outputs are simple and will not give highly reliable
-results.** They may be useful for generating instance segmentation training
-datasets, but will likely require manual correction to be good enough for
-training data.
-
-![dtm1.png](readme_images/dtm1.png)
-![input_point_cloud.png](readme_images/input_point_cloud.png)
-![segmented2.png](readme_images/segmented2.png)
-![cleaned_cyl_vis.png](readme_images/cleaned_cyl_vis.png)
-![individual_tree_segmentation.png](readme_images/individual_tree_segmentation.png)
-
-## User Parameters
-
-The desktop app and browser UI expose these directly; for the command line they
-live in `scripts/run.py`. The `PlotId` is taken from the filename of the input
-point cloud, so name files accordingly.
-
-### Set these appropriately for your hardware
-
-`batch_size` — number of samples per batch for deep learning inference. Must be
->= 2. Bigger is **not** faster: see [Performance](#performance).
-
-`num_cpu_cores` — CPU cores to use. 0 means all of them.
-
-`use_CPU_only` — set if you have no Nvidia GPU. Expect inference to take much
-longer, and note that CPU also appears to give worse semantic segmentation
-results than GPU.
-
-### Circular plot options
-
-`plot_centre` — [X, Y] coordinates of the plot centre in metres. If `None`, the
-centre of the bounding box of the point cloud is used.
-
-`plot_radius` — if 0 m, the plot is not cropped. Otherwise the plot is
-cylindrically cropped from the plot centre with plot_radius + plot_radius_buffer.
-
-`plot_radius_buffer` — used for Tree Aware Plot Cropping. Leave at 0 if not
-using.
-
-#### Tree Aware Plot Cropping
-
-The purpose of this mode is to simulate the behaviour of a typical field plot,
-by not chopping trees in half if they are at the boundary of the plot radius.
-
-The point cloud is first trimmed to plot_radius + plot_radius_buffer. For
-example, with a 4 m plot_radius and a 2 m plot_radius_buffer, the cloud is
-cropped to 6 m initially. FSCT then uses the measurements extracted from the
-trees in that 6 m cloud to check which tree centres are within the 4 m radius.
-This allows a tree just inside the boundary to extend 2 m beyond it without
-losing points. A simple radius trim at 4 m would cut such trees in half.
-
-![tree_aware_plot_cropping.png](readme_images/tree_aware_plot_cropping.png)
-
-This mode is used when plot_radius and plot_radius_buffer are both non-zero.
-
-### Optional settings — generally leave as they are
-
-| Parameter | Meaning |
-|---|---|
-| `slice_thickness` | Thickness of the horizontal stem slices. Raise to 0.2 for lower resolution clouds, drop to 0.1 for very dense ones |
-| `slice_increment` | Vertical spacing between slices. Smaller gives better results and a longer run time |
-| `height_percentile` | Use 98 rather than 100 if the data has noise above the canopy |
-| `ground_veg_cutoff_height` | Vegetation below this height is understory and is not assigned to individual trees |
-| `tree_base_cutoff_height` | A tree needs a cylinder below this height above the DTM to be kept. Filters unsorted branches from being called trees |
-| `veg_sorting_range` | Max horizontal distance from a cylinder for a vegetation point to be matched to that tree |
-| `sort_stems` | Turning this off speeds things up. Veg sorting is required for tree height, but stem sorting is not needed for general use |
-| `stem_sorting_range` | Max 3D distance from a cylinder for a stem point to be matched to that tree |
-| `taper_measurement_height_min` / `_max` / `_increment` | Range and step of the taper output |
-| `taper_slice_thickness` | Cleaned cylinders within ± 0.5 × this are found; the largest radius becomes the diameter at that height |
-| `delete_working_directory` | Deletes the segmentation working files when done. Turn off if you want to re-run segmentation without redoing preprocessing |
-| `minimise_output_size_mode` | Deletes non-essential outputs to save disk space |
-
-Advanced knobs live in `scripts/other_parameters.py`, including the two that
-control cylinder fitting cost (`circle_fit_trials`, `circle_fit_max_points`) and
-`fix_cci_sectors`, which corrects a units bug in the CCI sector calculation. It
-is off by default because turning it on shifts every downstream number. Two
-more of the same kind: `assign_unassigned_skeleton_points` (off) enables a
-skeleton-point recovery step that never worked in upstream FSCT, and
-`prewarm_worker_pool` (on) starts the measurement workers during GPU
-segmentation when there is enough free memory — turn it off on a machine that
-is short of RAM.
-
-## Reproducibility
-
-FSCT runs are deterministic: the same file, seed and batch size give the same
-output, and the output does not depend on how many CPU cores are used or how the
-work happened to be spread across workers. Four things used to be random:
-
-- boxes with more than `max_points_per_box` points were subsampled with an
-  unseeded `random.shuffle`
-- the farthest-point-sampling in `scripts/model.py` picks a random starting
-  point (`torch_cluster.fps` defaults to `random_start=True`)
-- the RANSAC circle fits were unseeded
-- worker results were collected in completion order, so the row order of every
-  downstream array depended on process scheduling
-
-All are now driven by `random_seed` in `scripts/other_parameters.py` (default
-`0`). Set it to `None` for the old non-reproducible behaviour, or to any other
-integer to sample differently. The box seed is derived per box id rather than
-per thread, and the circle-fit seed per stem cluster, so neither depends on
-thread or worker scheduling.
-
-Two caveats:
-
-- Reproducibility holds for the same file, seed **and batch size**. Changing the
-  batch size regroups the samples and so changes the order in which the model's
-  sampling draws from the seeded random stream. Results stay deterministic, they
-  just are not identical to a run at a different batch size.
-- With `use_amp=True` (the default) reproduction is very close but not bit-exact:
-  fp16 reductions are not deterministic, and two runs measured 2 differing labels
-  out of 673,517 (0.0003%). Set `use_amp=False` if you need byte-identical
-  output; seeded fp32 runs matched exactly.
+  in both interfaces.
+- **Installation self-test** (`test_installation.py`, `FSCT-Turbo.bat verify`):
+  checks Python, the deep-learning stack, the linear-algebra routines, the
+  point-cloud and reporting libraries, the core files, the FSCT imports, and
+  the optional GPU, LAStools and UI components.
+- **One version number** (`version.py`), shown in both interfaces, the
+  installation test, `FSCT-Turbo.bat version` and `batch_process.py --version`.
 
 ## Performance
 
-**FSCT is computationally expensive.** It is still considerably faster than a
-human at what it does, and considerably faster than the original.
+![Stage times, original FSCT against FSCT-Turbo](readme_images/stage_times.png)
 
-Every "Original FSCT" figure below is that code path as published in
-<https://github.com/SKrisanski/FSCT>, measured on the 673k-point
-`data/test/example.las`, RTX 3050 Laptop (4 GB), 16 CPU cores, on an otherwise
-idle machine. Absolute wall-clock times move a lot with background load and CPU
-clock — the same measurement stage was 19.5 s idle and 44 s with a browser and
-an editor running. Every pair was measured back to back under the same
-conditions, so the ratios hold even where the absolute numbers do not.
+Measured on `data/test/example.las` (673,517 points, four trees) on a laptop
+with a Ryzen 7 7735HS, 16 GB RAM and an RTX 3050 Laptop GPU (4 GB). Original
+FSCT is [SKrisanski/FSCT](https://github.com/SKrisanski/FSCT) at `68e2f1e`,
+with library-compatibility edits only. Both ran with upstream's default
+parameters, batch size 2 and 8 workers. Runs were interleaved (original, Turbo
+fp32, Turbo fp16) and the sequence repeated twice, so each ratio compares runs
+made minutes apart. Absolute times on a busy workstation can move by a factor
+of two; the ratios hold.
 
-### Where the time goes
+| Stage           | Original FSCT | FSCT-Turbo, default (fp32) | FSCT-Turbo, `use_amp=True` (fp16) |
+| --------------- | ------------: | -------------------------: | --------------------------------: |
+| Preprocessing   |        3.68 s |              0.85 s (4.3x) |                     0.88 s (4.2x) |
+| Segmentation    |       21.17 s |            18.36 s (1.15x) |                   15.47 s (1.37x) |
+| Post-processing |        1.53 s |             1.32 s (1.16x) |                    1.24 s (1.23x) |
+| Measurement     |      304.07 s |            13.81 s (22.0x) |                   12.87 s (23.6x) |
+| **Total**       |  **330.46 s** |         **34.35 s (9.6x)** |               **30.46 s (10.8x)** |
 
-| Stage | Original FSCT | This version |
-|---|---|---|
-| Preprocessing | 4.04 s | 0.70 s |
-| Segmentation | 24.1 s | 17.0 s |
-| Post-processing | — | 1.6 s |
-| Measurement | see below | 19.5 s |
+fp16 is faster but not bit-exact, so it is off by default; see
+[Reproducibility](#reproducibility).
 
-For a whole-run reference point, the full pipeline on the 673k-point
-`data/test/example_clean.las` — preprocessing, segmentation, post-processing,
-measurement and report — completes in **88 s** at 16 cores, batch 4, with
-`use_amp` on.
+The network and its weights are unchanged. Most of the changes are exact
+reformulations, giving the same output for the same random draws at a lower
+asymptotic cost:
 
-### Measurement stage
+- **Circle fitting** dominated the original run. RANSAC trials are now formed,
+  solved and scored as arrays instead of one Python loop iteration each, with
+  the same model, scoring and stopping rule.
+- **Box extraction** used a boolean scan of the whole cloud per box. It is now
+  one shared k-d tree with a Chebyshev-ball query, which is exactly an
+  axis-aligned cube, and the GIL is released so the worker threads run in
+  parallel.
+- **Segmentation output** is moved off the GPU once per batch instead of seven
+  blocking copies, four of them in a per-sample loop. Mixed precision (fp16) is
+  available with `use_amp=True`.
+- **Label transfer** back to the full cloud works in blocks of 250,000 points on
+  four columns instead of one (N, 16, 7) temporary, so memory no longer grows
+  with the plot.
+- **Cylinder sorting, cleaning and volume summation** rebuilt a spatial index
+  and copied the array for every cylinder. One index plus an active mask gives
+  the same order and the same neighbourhoods.
+- **Slice and plane cutting** sort once and binary-search instead of scanning
+  per slice or per skeleton position. **Slice clustering** runs in parallel.
+- **The DTM** is built with four threaded counting queries instead of a Python
+  loop grown with `np.vstack`, and triangulated once instead of three times per
+  tree.
+- **One worker pool**, started during GPU segmentation when memory allows,
+  replaces four pools spawned on demand. Each spawn re-imported numpy, scipy,
+  sklearn and hdbscan in every worker on Windows.
 
-The measurement stage was dominated by circle fitting. `skimage.measure.ransac`
-was called with `min_samples` set to 30% of the slice and `max_trials=10000`.
-That combination is one for which RANSAC's early-stopping rule almost never
-fires, so nearly every circle ran the full 10,000 trials, each one a Python-level
-`np.linalg.lstsq` plus a residual pass over every point in the slice.
+Two changes trade exactness for speed and are reported separately. The RANSAC
+trial cap was lowered from 10,000 to 1,000, and slices with more than 1,500
+points are subsampled for fitting (CCI still uses every point). Together they
+give most of the circle-fitting speed-up:
 
-| Measurement | Original FSCT | This version | |
-|---|---|---|---|
-| One circle fit (60 real stem slices) | 2737 ms | 28.6 ms | **96x** |
-| Cylinder fitting, all clusters, single process | 1739 ms/cylinder | 29 ms/cylinder | **60x** |
-| Whole measurement stage, 16 cores | — | 19.5 s | |
+![Circle-fit ablation](readme_images/circle_fit.png)
 
-What changed in the measurement stage:
-
-- **The circle RANSAC is batched.** Trials are sampled, fitted and scored with
-  array operations instead of one Python loop iteration each, and the same
-  dynamic stopping rule is applied after every batch. Same model, same scoring,
-  same stopping criterion. Agreement with skimage was checked on 60 real stem
-  slices: median radius difference 1.5 mm and 95th percentile 33 mm, against
-  35 mm of disagreement between two independent skimage runs on the same slices.
-  `circle_fit_trials` and `circle_fit_max_points` in `other_parameters.py`
-  control the trial count and the point cap.
-- **Plane slicing is indexed, not scanned.** Selecting the points near each
-  circle's plane scanned the whole stem cluster once per skeleton position. It
-  now binary-searches a pre-sorted coordinate first, and returns an identical
-  slice.
-- **Cylinder sorting and cleaning are no longer quadratic.** Both rebuilt a
-  spatial index and copied the whole array on every iteration. One index plus an
-  active mask gives the same processing order and the same neighbourhoods.
-- **Cylinder visualisation is vectorised.** It used to dispatch one pool task per
-  cylinder to produce 15 points; the two visualisation passes were 21 s of a
-  55 s stage, and are now under a second.
-- **Slice clustering runs in parallel**, and cutting the slices binary-searches
-  a sorted height instead of boolean-scanning the whole stem cloud per slice.
-- **One worker pool** is shared by every parallel stage. Spawning a pool on
-  Windows re-imports numpy, scipy, sklearn and hdbscan in each worker; that was
-  being paid three times per run.
-- **`np.percentile(..., interpolation=)`** was removed in numpy 2.0. The
-  measurement stage crashed on it, just before tree heights were computed.
-
-Earlier work on the front half of the pipeline:
-
-- **Box extraction** was O(boxes × points) — it boolean-scanned the entire cloud
-  once per box. Now one shared `cKDTree`, queried with a Chebyshev (p=inf) ball,
-  which is exactly an axis-aligned cube. `cKDTree` releases the GIL, so the
-  worker threads now genuinely run in parallel.
-- **Segmentation output assembly** called `.cpu()` seven times per iteration,
-  four of them inside a per-sample inner loop; each is a blocking device sync.
-  Now one transfer per batch. Verified: 0 label differences across 1.6M points.
-- **`choose_most_confident_label`** ran its kNN query single-threaded and built
-  an `(N, 16, 7)` temporary — about 600 MB at 700k points — to read 4 columns.
-- **Mixed precision** (`use_amp`), which on a small GPU matters as much for
-  memory as for arithmetic.
-- **DTM construction** grew its array with `np.vstack` inside a nested loop,
-  making it quadratic in grid cells (40,000 cells for a 100 × 100 m plot at
-  0.5 m resolution).
+They move the fitted radius by a median of 0.7 mm, against 0.1 mm between two
+runs of the original fit with different seeds. Set `circle_fit_trials=10000`
+and `circle_fit_max_points=0` to get the original behaviour back.
 
 ### Batch size: bigger is not faster
 
-Segmentation memory scales with the batch, and overflowing VRAM is much worse
-than a small batch. In fp32 on a 4 GB card:
+Segmentation memory scales with the batch, and spilling out of VRAM costs far
+more than a small batch. In fp32 on a 4 GB card:
 
-| batch | time | peak VRAM |
-|---|---|---|
-| 2 | 17.0 s | 1.37 GB |
-| 4 | 25.3 s | 2.42 GB |
-| 6 | 54.2 s | 3.28 GB |
+| batch | time   | peak VRAM |
+| ----- | ------ | --------- |
+| 2     | 17.0 s | 1.37 GB   |
+| 4     | 25.3 s | 2.42 GB   |
+| 6     | 54.2 s | 3.28 GB   |
 
-Past roughly 2.5 GB the driver starts paging activations to host memory and
-throughput collapses. Mixed precision roughly halves the requirement, so
-`batch=4` with `use_amp=True` measured 8.4 s for the same work. The desktop app
-picks a default batch size from the detected VRAM and says so under the slider.
-Raising it beyond that is usually a pessimisation.
+Mixed precision roughly halves the memory needed. The desktop app picks the
+default batch size from the detected VRAM and says so under the slider.
 
-### Recommended PC specifications
+### Large clouds
 
-A CUDA-compatible Nvidia GPU is **strongly recommended**. Most modern gaming
-desktops or decently powerful laptops will do. The original author's setup:
+The 5.1-million-point plot that ran out of memory on a 16 GB machine with the
+original code completes end to end in 156 s on a quiet machine.
 
-- CPU: Intel i9-10900K
-- GPU: Nvidia Titan RTX (24 GB vRAM)
-- RAM: 128 GB DDR4 (if you run out of RAM, try increasing your page file size on
-  Windows or swap size on Linux)
+## Reproducibility
 
-## Scripts
+FSCT-Turbo gives the same answer every time. A run is bit-identical to any
+other run of the same file with the same `random_seed`, whatever the CPU core
+count, the batch size, the order the filesystem lists files in, or whether it is
+the first or tenth plot in a batch.
 
-### Scripts you would normally interact with
+In the original code, repeat runs on the same file disagreed on 7 to 8% of
+point labels, and a CPU-only machine segmented worse than a GPU. The causes,
+and what replaced each:
 
-| Script | Purpose |
-|---|---|
-| `fsct_desktop.py` | Desktop application. Launch with `FSCT.bat gui` |
-| `fsct_web.py` | Browser UI. Launch with `FSCT.bat web` |
-| `scripts/run.py` | Command-line entry point; edit the parameters at the top |
-| `batch_process.py` | Process a whole directory of point clouds unattended |
-| `scripts/combine_multiple_output_CSVs.py` | Combines all `plot_summary.csv` files into one CSV, saved in the highest common directory of the selected clouds |
-| `scripts/run_with_multiple_plot_centres.py` | Enter plot coordinates for each of several clouds |
-| `test_installation.py` | Installation checks. Run with `FSCT.bat verify` |
+| Original behaviour | FSCT-Turbo |
+| --- | --- |
+| Boxes over `max_points_per_box` subsampled with an unseeded shuffle | Seeded by the box's id |
+| Farthest-point sampling started at a random point, drawn from a different generator on CPU and GPU, from one stream shared across the batch | Start seeded by the box's id, identical on both devices |
+| On CPU, the network's 64-neighbour limit kept neighbours in k-d tree order; on the GPU, in index order, which is what the model was trained on | Index order on both |
+| Box files read in filesystem order, which decided batching and the order of the assembled cloud | Read in box-id order |
+| Feature interpolation summed with GPU atomics, in whatever order they land | Summed in a fixed order |
+| RANSAC circle fits unseeded | Seeded by the stem cluster |
+| Worker results collected in completion order | Collected in task order |
 
-### Scripts you would only use directly if modifying the software
+Set `random_seed=None` for the original non-reproducible behaviour.
 
-| Script | Purpose |
-|---|---|
-| `scripts/run_tools.py` | Helper functions that clean up `run.py` |
-| `scripts/tools.py` | Other helper functions used throughout the code base |
-| `scripts/preprocessing.py` | Subsamples the input cloud and slices it into samples the segmentation model can work with |
-| `scripts/model.py` | The segmentation model, modified from the PyTorch Geometric implementation of PointNet++ |
-| `scripts/inference.py` | Runs semantic segmentation on the samples and reassembles them into a full cloud |
-| `scripts/post_segmentation_script.py` | Creates the DTM, cleans the segmented cloud and writes the class-specific clouds |
-| `scripts/measure.py` | Extracts measurements and metrics from the post-segmentation outputs |
-| `scripts/report_writer.py` | Summarises the measurements in a simple report format |
-| `scripts/other_parameters.py` | Advanced parameters |
-| `visualization_utils.py` | Plot helpers for the browser UI |
-| `setup_lastools.py` | Downloads and configures LAStools |
-| `make_icon.py` | Redraws the application icon (`icon.ico`, `icon.png`). Only needed if the artwork changes |
+On the example plot, runs at batch size 1, 2 and 4, on 8 and 16 cores, in
+one process or a fresh one, all give the same 673,517 labels; a CPU run differs
+from a GPU run on 84 of them and measures the same four trees, with identical
+DBH and height. Repeat runs of the original differ on about
+50,000. [CHANGELOG.md](CHANGELOG.md) has the details.
 
-## Known limitations
+One option trades exactness for speed: `use_amp=True` runs segmentation in
+fp16, about 15% faster on that stage, but fp16 reductions are not
+bit-reproducible (2 of 673,517 labels differed between identical runs) and
+about 0.17% of labels differ from fp32. It is off by default.
 
-* Young trees with a lot of branching do not currently get segmented correctly.
-* Some extremely large trees do not currently get measured properly as the rules
-  don't always hold.
-* FSCT is unlikely to output useful results on low resolution point clouds.
-  *Very high* resolution aerial LiDAR is about the lowest it can currently cope
-  with. If your dataset is on the borderline, try setting
-  `low_resolution_point_cloud_hack_mode` in `other_parameters.py` to 4 or 5 and
-  rerunning. It's an ugly hack, but it can help sometimes.
-* Segmentation does often miss some branches, but usually gets the bulk of them.
-* Small branches are often not detected.
-* Completely horizontal branches/sections may not be measured correctly from the
-  method used.
-* The CCI sector angles are built in degrees but consumed as radians, so the 80
-  "evenly spaced sectors" are really 80 arbitrary directions. They land
-  quasi-uniformly around the circle, so CCI still roughly tracks circumferential
-  coverage, but the values are not what the method describes. `fix_cci_sectors`
-  corrects it; it is off by default because CCI decides which cylinders survive,
-  so stem count, DBH and tree height all move with it.
+What stays approximate is arithmetic across hardware: a CPU and a GPU, or two
+GPU generations, round floating-point sums differently, which can flip a
+point whose top two class scores are within rounding of each other. The
+neighbourhoods, samples and seeds are identical everywhere.
 
-## Training a new semantic segmentation model
+## Correctness and compatibility fixes
 
-FSCT relies heavily on the segmentation model working properly. Training your own
-model may help expand the utility of FSCT to datasets outside the original
-training set.
+Fixed relative to the original code; each is described in full in
+[CHANGELOG.md](CHANGELOG.md):
 
-### Step 1 — Creating training data
+- **Runs on current libraries.** `np.percentile(..., interpolation=)` was
+  removed in numpy 2.0 and crashed the measurement stage just before tree
+  heights. `pandas.read_csv(delim_whitespace=)` was removed in pandas 3.0.
+  `DataLoader` moved out of `torch_geometric.data` in PyG 2.0.
+- **`Volume_1` was wrong twice over.** The frustum formula added a length to an
+  area, and every radius was halved a second time on the way in. On the example
+  plot, tree 1 moves from 1.61 m³ to 0.66 m³, next to an independently
+  estimated `Volume_2` of 0.53 m³.
+- **`CCI_at_BH` counted every tree's stem points**, so a neighbouring stem could
+  count as coverage of this tree's circumference. It now uses the tree's own.
+- **Branch-to-parent interpolation matched the wrong parent cylinder** when a
+  branch had several candidates.
+- **Large clouds no longer run out of memory** at the end of segmentation.
+- **A dead worker no longer hangs the run.** It now stops within 30 s and says
+  what happened.
+- **Degenerate plots** (no DTM grid cell, zero hull area) no longer abort at the
+  very end with `ZeroDivisionError`.
+- **`get_fsct_path` only worked in a folder named exactly `FSCT`.** It is now
+  derived from the module's own location.
 
-Unless you modify the code, training data must be provided as a `.las` file with
-a `label` column, with integer labels as follows: 1 Terrain, 2 Vegetation,
-3 Coarse woody debris, 4 Stems/branches.
+Kept on purpose, so measurements stay comparable with published FSCT results:
 
-Look at a `segmented.las` or `segmented_cleaned.las` file as an example of what
-the training data must look like. It is strongly recommended to use FSCT to label
-your data, **then** correct it manually.
+- **Cylinder sorting emits one cylinder short**, as the original loop does.
+- **CCI sectors are not evenly spaced.** The sector angles are built in degrees
+  but used as radians. `fix_cci_sectors=True` corrects it; it is off by default
+  because CCI decides which cylinders survive, so stem count, DBH and height all
+  move with it.
 
-**Note: manually segmenting/correcting point clouds is extremely tedious.** The
-original dataset took the author 3-4 weeks to label from scratch. CloudCompare's
-segmentation tool works well for manual correction; start by loading
-`terrain_points.las`, `vegetation_points.las`, `cwd_points.las` and
-`stem_points.las`. Take great care to label consistently — sloppy labelling may
-result in your model not learning what you want it to learn.
+## New parameters
 
-### Step 2 — Preparing training data
+All in `scripts/other_parameters.py`. The parameters inherited from FSCT are
+documented in the [original README](https://github.com/SKrisanski/FSCT#user-parameters).
 
-Chop your chosen point cloud into train, validation and test slices — 50%, 25%
-and 25% is a reasonable split, but use your discretion. Save each slice as a
-`.las` file and place them in `data/train/`, `data/validation/` and `data/test/`.
+| Parameter                           | Default | What it does                                                                                     |
+| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `random_seed`                       | `0`     | Seeds every random step. `None` restores the original non-reproducible behaviour                 |
+| `use_amp`                           | `False` | `True` runs segmentation in fp16 on the GPU: faster, half the memory, but not bit-exact          |
+| `prewarm_worker_pool`               | `True`  | Starts the measurement workers during segmentation. Turn off on a machine short of RAM           |
+| `circle_fit_trials`                 | `1000`  | RANSAC trial cap per circle. The original used 10,000                                            |
+| `circle_fit_max_points`             | `1500`  | Points used per circle fit; `0` uses all. CCI always uses every point                            |
+| `fix_cci_sectors`                   | `False` | Uses truly evenly spaced CCI sectors. Changes results                                            |
+| `assign_unassigned_skeleton_points` | `False` | Enables a skeleton-point recovery step that never worked in the original. Changes results        |
 
-You can have multiple point clouds in those directories; during preprocessing
-they are all placed in the respective `sample_dir` directories.
+## Files added by FSCT-Turbo
 
-### Step 3 — Preprocessing the training data
+| File                              | Purpose                                                               |
+| --------------------------------- | --------------------------------------------------------------------- |
+| `FSCT-Turbo.bat`                | Installer and launcher                                                |
+| `fsct_desktop.py`               | Desktop application                                                   |
+| `fsct_web.py`                   | Browser UI                                                            |
+| `fsct_job.py`                   | Default parameters; runs the pipeline in a process the UIs can stop   |
+| `visualization_utils.py`        | Plot builders for the browser UI                                      |
+| `batch_process.py`              | Unattended directory processing, configured by `wrapper_config.json` |
+| `setup_lastools.py`             | Downloads and configures LAStools                                     |
+| `test_installation.py`          | Installation checks                                                   |
+| `tests/`                        | Regression tests: `python -m unittest discover -s tests`             |
+| `version.py`                    | The version number                                                    |
+| `make_icon.py`                  | Redraws `icon.ico` and `icon.png`                                  |
+| `readme_images/make_figures.py` | Redraws this README's figures from a run on the example plot          |
 
-Set `preprocess_train_datasets`, `preprocess_validation_datasets` and
-`preprocess_test_datasets` to True and run `scripts/train.py`. After the first
-run, set them back to False to avoid duplicating samples in `sample_dir`.
+Everything under `scripts/`, `model/`, `tools/` and `data/` comes from the
+original repository; FSCT-Turbo's changes to `scripts/` are listed in
+[CHANGELOG.md](CHANGELOG.md).
 
-**Preprocessing adds files to `sample_dir` but does not delete them.** So when
-adding a new training cloud you have two options:
+## Credits and acknowledgements
 
-- **Option A** — move the already-processed clouds out of `data/train/`, add the
-  new one, run preprocessing, then move them back. Only the new cloud is
-  processed.
-- **Option B** — leave everything in place, manually delete the contents of
-  `sample_dir`, and re-run preprocessing for everything.
+**FSCT** was created by **Sean Krisanski** at the University of Tasmania, with
+Mohammad Sadegh Taskhiri, Susana Gonzalez Aracil, David Herries, Allie Muneri,
+Mohan Gurung, James Montgomery and Paul Turner. The semantic
+segmentation model and its trained weights (`model/model.pth`), the measurement
+method, the example point cloud and most of the code under `scripts/` are their
+work, from [https://github.com/SKrisanski/FSCT](https://github.com/SKrisanski/FSCT). FSCT-Turbo would not exist
+without it.
 
-Both achieve the same thing; A is more efficient, B is necessary if you want to
-*remove* a sample cloud from the dataset.
+FSCT-Turbo also builds on:
 
-### Step 4 — Train the model
-
-Set the parameters according to your hardware. If you have CUDA errors, reduce
-the batch size or switch to CPU mode. `scripts/training_monitor.py` plots the
-loss and accuracy; run it in a separate terminal alongside the training script.
-
-**The training process will take several days on a powerful desktop computer.**
-
-### Step 5 — Use the trained model
-
-Change `model_filename` in `scripts/other_parameters.py` to the model you named
-in `train.py`.
-
-### An idea potentially worth exploring
-
-FSCT is already capable of producing reasonably well segmented point clouds
-(within the stated limitations). By leveraging FSCT to automatically segment
-point clouds, it seems likely that the model could almost train itself into a
-more consistent and robust state through the use of carefully designed data
-augmentations.
+- [PointNet++](https://github.com/charlesq34/pointnet2) (Qi et al., 2017), the
+  architecture behind the segmentation model, via the
+  [PyTorch Geometric](https://pytorch-geometric.readthedocs.io/) implementation;
+- [PyTorch](https://pytorch.org/), [scikit-image](https://scikit-image.org/),
+  [scikit-learn](https://scikit-learn.org/), [hdbscan](https://github.com/scikit-learn-contrib/hdbscan)
+  and [laspy](https://github.com/laspy/laspy);
+- [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter),
+  [Streamlit](https://streamlit.io/) and [Plotly](https://plotly.com/python/)
+  for the interfaces;
+- [LAStools](https://rapidlasso.de/) by rapidlasso, which is downloaded
+  separately and is subject to its own licence terms.
 
 ## Citation
 
-If you wish to cite this work, please use the citation below. If citing for
-something other than a scientific journal, feel free to link to the GitHub
-instead.
+If you use FSCT-Turbo in published work, please cite the original FSCT papers:
 
 > Krisanski, S.; Taskhiri, M.S.; Gonzalez Aracil, S.; Herries, D.; Muneri, A.;
-> Gurung, M.B.; Montgomery, J.; Turner, P. Forest Structural Complexity Tool—An
-> Open Source, Fully-Automated Tool for Measuring Forest Point Clouds. Remote
-> Sens. 2021, 13, 4677. https://doi.org/10.3390/rs13224677
+> Gurung, M.B.; Montgomery, J.; Turner, P. Forest Structural Complexity Tool:
+> An Open Source, Fully-Automated Tool for Measuring Forest Point Clouds.
+> *Remote Sensing* 2021, 13, 4677. [https://doi.org/10.3390/rs13224677](https://doi.org/10.3390/rs13224677)
 
-## Use of this code
+> Krisanski, S.; Taskhiri, M.S.; Gonzalez Aracil, S.; Herries, D.; Turner, P.
+> Sensor Agnostic Semantic Segmentation of Structurally Diverse and Complex
+> Forest Point Clouds Using Deep Learning. *Remote Sensing* 2021, 13, 1413.
+> [https://doi.org/10.3390/rs13081413](https://doi.org/10.3390/rs13081413)
 
-Please feel free to use/modify/share this code. If you can improve/evaluate the
-code somehow and wish to make a paper of it, please do. Commercial use of FSCT is
-also permitted. Sharing your improvements would be great, but you are not
-obligated.
+Please also state the FSCT-Turbo version you used (`FSCT-Turbo.bat version`),
+since `Volume_1` and `CCI_at_BH` differ from the original FSCT.
 
-Upstream project: https://github.com/SKrisanski/FSCT
+## License
 
-## Acknowledgements
-
-This research was funded by the Australian Research Council — Training Centre for
-Forest Value (IC150100004), University of Tasmania, Australia.
-
-Thanks to the supervisory team, Assoc. Prof Paul Turner and Dr. Mohammad Sadegh
-Taskhiri from the eLogistics Research Group and Dr. James Montgomery from the
-University of Tasmania.
-
-Thanks to Susana Gonzalez Aracil and David Herries from Interpine Group Ltd
-(New Zealand) https://interpine.nz/, and Allie Muneri and Mohan Gurung from
-PF Olsen (Australia) Ltd. https://au.pfolsen.com/, who provided a number of the
-raw point clouds and plot measurements used during the development and validation
-of this tool.
-
-## References
-
-The deep learning component uses PyTorch https://pytorch.org/ and PyTorch
-Geometric https://pytorch-geometric.readthedocs.io/
-
-The first step is semantic segmentation of the forest point cloud, performed
-using a modified version of PointNet++ https://github.com/charlesq34/pointnet2,
-starting from the PyTorch Geometric implementation
-https://github.com/pyg-team/pytorch_geometric/blob/master/examples/pointnet2_segmentation.py
+GPL-3.0, the same as the original FSCT. See [LICENSE](LICENSE).

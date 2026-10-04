@@ -20,7 +20,7 @@ for _path in (os.path.join(PROJECT_ROOT, 'scripts'), PROJECT_ROOT):
 
 from version import __version__
 from scripts.run_tools import FSCT
-from scripts.other_parameters import other_parameters
+from fsct_job import job_parameters
 
 
 def load_config(config_file='wrapper_config.json'):
@@ -29,9 +29,18 @@ def load_config(config_file='wrapper_config.json'):
 
     A malformed or unreadable config used to abort the whole batch with a raw
     JSONDecodeError traceback before a single file was processed. Report it and
-    carry on instead - the defaults in other_parameters.py are enough to run.
+    carry on instead - fsct_job.DEFAULT_PARAMETERS is enough to run.
+
+    A relative path that does not exist from the current directory is looked
+    up next to this script, so `python path/to/batch_process.py` finds the
+    shipped wrapper_config.json from anywhere.
     """
+    if not os.path.isabs(config_file) and not os.path.exists(config_file):
+        beside_script = os.path.join(PROJECT_ROOT, config_file)
+        if os.path.exists(beside_script):
+            config_file = beside_script
     if not os.path.exists(config_file):
+        print(f"Note: {config_file} not found; using the default parameters.")
         return {}
     try:
         with open(config_file, 'r') as f:
@@ -80,13 +89,13 @@ def batch_process_fsct(input_directory, parameters=None, recursive=True,
         Dictionary with processing results
     """
 
-    # Load default parameters
-    config = load_config(config_file)
+    # Start from the shared defaults and lay the config on top. Taking the
+    # config's dict as the whole parameter set made every key it lacked a
+    # KeyError inside FSCT - the shipped wrapper_config.json had no
+    # plot_centre, so every file failed before a point was read.
     if parameters is None:
-        parameters = config.get('default_parameters', {})
-
-    # Add other_parameters
-    parameters.update(other_parameters)
+        parameters = load_config(config_file).get('default_parameters', {})
+    parameters = job_parameters(**parameters)
 
     # Find all point cloud files
     point_clouds = get_las_files(input_directory, recursive)
@@ -271,17 +280,26 @@ def main():
         combine_plot_summaries(args.input_dir)
     else:
         # Process files. --config was previously parsed and then ignored.
-        results = batch_process_fsct(
-            args.input_dir,
-            recursive=not args.no_recursive,
-            config_file=args.config
-        )
-        
+        try:
+            results = batch_process_fsct(
+                args.input_dir,
+                recursive=not args.no_recursive,
+                config_file=args.config
+            )
+        except KeyError as error:  # a misspelt parameter in the config
+            print(f"Error in {args.config}: {error.args[0]}")
+            return 2
+
         # Combine results
         if results['processed'] > 0:
             print("\nCombining plot summaries...")
             combine_plot_summaries(args.input_dir)
-    
+
+        # Non-zero if anything failed, so a script or scheduler running the
+        # batch can tell. It used to exit 0 even when every file had failed.
+        if results['failed'] > 0:
+            return 1
+
     return 0
 
 

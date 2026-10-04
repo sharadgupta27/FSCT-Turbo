@@ -1,6 +1,6 @@
 {
-    "lastools_path": "",
     "default_parameters": {
+        "plot_centre": null,
         "batch_size": 2,
         "use_CPU_only": false,
         "num_cpu_cores": 0,
