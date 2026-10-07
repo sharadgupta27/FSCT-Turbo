@@ -16,14 +16,9 @@ Check which version you have with `FSCT-Turbo.bat version`.
 2. Double-click **`FSCT-Turbo.bat`**.
 
 That's it. The first run installs everything by itself: conda environment,
-PyTorch, both interfaces and LAStools, and asks nothing. It takes 15-25 minutes
-and needs about 6 GB. Every run after that just asks what you want to launch:
-
-```text
-  1.  Desktop app
-  2.  Browser UI
-  0.  Exit
-```
+PyTorch, the desktop app and LAStools, and asks nothing. It takes 15-25 minutes
+and needs about 6 GB, then starts the desktop app. Every run after that starts
+the desktop app straight away.
 
 ---
 
@@ -36,9 +31,8 @@ takes commands:
 
 | Command | What it does |
 |---|---|
-| `FSCT-Turbo.bat` | Set up if needed, then choose what to launch |
-| `FSCT-Turbo.bat gui` | Launch the desktop app directly |
-| `FSCT-Turbo.bat web` | Launch the browser UI directly |
+| `FSCT-Turbo.bat` | Set up if needed, then launch the desktop app |
+| `FSCT-Turbo.bat gui` | Launch the desktop app, skipping the setup check |
 | `FSCT-Turbo.bat setup` | Re-run setup, keeping the environment |
 | `FSCT-Turbo.bat setup /force` | Rebuild the environment from scratch |
 | `FSCT-Turbo.bat verify` | Run the installation checks |
@@ -50,7 +44,8 @@ Delete it to force setup to run again on the next launch. The stamp also carries
 a version number, so bumping the package set in `FSCT-Turbo.bat` makes existing
 installs refresh themselves automatically.
 
-Both interfaces share the **same** `lidar` conda environment.
+The desktop app, the command line and batch processing all use the **same**
+`lidar` conda environment.
 
 ### Version matrix
 
@@ -110,17 +105,14 @@ conda run -n lidar --no-capture-output python -m pip install torch-cluster ^
 conda run -n lidar --no-capture-output python -m pip install ^
     mdutils markdown python-louvain scikit-spatial customtkinter
 
-conda run -n lidar --no-capture-output python -m pip install ^
-    streamlit plotly pydeck statsmodels
-
 conda run -n lidar --no-capture-output python setup_lastools.py
 conda run -n lidar --no-capture-output python test_installation.py
 ```
 
 Replace `cu121` with `cpu` in both URLs if you have no Nvidia GPU.
 
-`requirements.txt` is the single requirements file: core pipeline, desktop app
-and browser UI. `FSCT-Turbo.bat` runs `pip install -r requirements.txt` as its final
+`requirements.txt` is the single requirements file: core pipeline and desktop
+app. `FSCT-Turbo.bat` runs `pip install -r requirements.txt` as its final
 dependency step, so the same file that describes a plain-venv install is the one
 the supported installer exercises.
 
@@ -287,30 +279,7 @@ check when something fails to import.
 
 ---
 
-## 3. Running the browser UI
-
-```bat
-FSCT-Turbo.bat web
-```
-
-It opens automatically at <http://localhost:8501>. If it doesn't, navigate there
-manually. If the port is taken:
-
-```bat
-conda run -n lidar streamlit run fsct_web.py --server.port 8502
-```
-
-The workflow mirrors the desktop app: upload in **File Upload & Processing**,
-convert or resample in **File Operations**, set parameters in the sidebar and
-press **Run FSCT Inference**, then explore CSV tables, interactive plots and
-generated figures in **Results & Visualization**. While a run is going, the
-Run tab shows the current stage and the latest output, and **Stop analysis**
-ends it; changing other settings meanwhile does not interrupt it. Outputs can be downloaded
-directly from the browser.
-
----
-
-## 4. Running from the command line
+## 3. Running from the command line
 
 ### A single plot, or a hand-picked set
 
@@ -357,7 +326,7 @@ highest common directory of the selected point clouds.
 
 ---
 
-## 5. Choosing parameters
+## 4. Choosing parameters
 
 ### By file size
 
@@ -398,7 +367,7 @@ Noisy data above the canopy: set height percentile to 98.
 
 ---
 
-## 6. Example data
+## 5. Example data
 
 One test file ships with the project: `data/test/example.las`, the example
 plot from the original FSCT. A complete run of `data/test/example.las` takes well under a minute on a laptop
@@ -406,7 +375,7 @@ RTX 3050.
 
 ---
 
-## 7. Troubleshooting
+## 6. Troubleshooting
 
 **"Failed to create environment" / solver conflicts**
 Run `FSCT-Turbo.bat setup /force`. A part-built environment from an earlier failed run
@@ -466,7 +435,7 @@ vegetation, the cloud is likely too low resolution for the segmentation model.
 
 ---
 
-## 8. Getting help
+## 7. Getting help
 
 - Upstream project and issues: https://github.com/SKrisanski/FSCT
 - Example files in `data/`

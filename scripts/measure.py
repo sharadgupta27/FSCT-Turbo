@@ -163,6 +163,11 @@ class MeasureTree:
             segment_angle_to_horiz=12,
             height_above_dtm=13,
         )
+        # Columns of make_cyl_visualisation_array's output: each circle point's
+        # x, y, z, then the last eight cylinder fields. Saving those files with
+        # the full cyl_dict declared nx, ny and nz too, three extra fields that
+        # held nothing but zeros.
+        self.cyl_vis_headers = ["x", "y", "z"] + list(self.cyl_dict)[6:]
 
         self.veg_dict = dict(x=0, y=1, z=2, red=3, green=4, blue=5, label=6, height_above_dtm=7, tree_id=8)
         self.stem_dict = dict(x=0, y=1, z=2, red=3, green=4, blue=5, label=6, height_above_dtm=7, tree_id=8)
@@ -756,10 +761,16 @@ class MeasureTree:
         never fires on a noisy stem slice, so it ran the full 10,000 trials:
         measured at 1.7 s for a single circle, and a plot needs thousands of
         them. Here a chunk of trials is sampled, fitted and scored with a
-        handful of array operations, and the same dynamic stopping rule is
-        applied after each chunk. Same model, same scoring, same stopping
-        criterion; the arithmetic just happens in numpy rather than in the
-        interpreter.
+        handful of array operations, and the dynamic stopping rule is applied
+        after each chunk. Same model and same scoring as skimage. The stopping
+        rule is skimage's formula at probability 0.99, where upstream FSCT
+        left skimage's default of 1 - so this is not the same criterion, but
+        with min_samples at 30% of the slice neither value ever lets the rule
+        fire in practice, and every fit runs to max_trials either way
+        (measured: 762 ms against 740 ms per fit on 60 real slices). The
+        speed-up over the original comes from batching (2.6x) and from the
+        lower max_trials and point cap in other_parameters.py (the rest of
+        69x), not from the stopping rule.
 
         Returns (xc, yc, r) of the model refitted on the best consensus set, or
         None if no consensus set was found.
@@ -1796,7 +1807,7 @@ class MeasureTree:
             initial_cyl_vis = self.make_cyl_visualisation_array(full_cyl_array)
 
             print("\nSaving cylinder visualisation...")
-            save_file(self.output_dir + "initial_cyl_vis.las", initial_cyl_vis, headers_of_interest=list(self.cyl_dict))
+            save_file(self.output_dir + "initial_cyl_vis.las", initial_cyl_vis, headers_of_interest=self.cyl_vis_headers)
         print("Sorting Cylinders...")
         full_cyl_array = self.cylinder_sorting(
             full_cyl_array,
@@ -2016,7 +2027,7 @@ class MeasureTree:
             save_file(
                 self.output_dir + "interpolated_cyl_vis.las",
                 interpolated_cyl_vis,
-                headers_of_interest=list(self.cyl_dict),
+                headers_of_interest=self.cyl_vis_headers,
             )
 
         tree_data = np.zeros((0, 16))
@@ -2100,6 +2111,16 @@ class MeasureTree:
             results = results[1][mask]
             self.vegetation_points[:, self.veg_dict["tree_id"]] = cleaned_cyls[results, self.cyl_dict["tree_id"]]
 
+            # Stem points are sorted exactly like vegetation: to the nearest
+            # cylinder horizontally, within veg_sorting_range. The original
+            # FSCT does the same and never reads stem_sorting_range, although
+            # it documents that parameter as a 3D limit. Doing what the
+            # documentation says was tried and is worse: cylinders exist only
+            # where a circle could be fitted, so much of the upper stem lies
+            # more than 1 m from any cylinder in 3D while sitting directly
+            # above one. On the example plot it left 120,231 of 164,553 stem
+            # points assigned, and the rest would vanish from the
+            # tree-segmented output cloud. Tree data was identical either way.
             kdtree = spatial.cKDTree(cleaned_cyls[:, :2], leafsize=1000)
             results = kdtree.query(self.stem_points[:, :2], k=1, workers=-1)
             mask = results[0] <= self.parameters["veg_sorting_range"]
@@ -2382,7 +2403,7 @@ class MeasureTree:
 
                 print("\nSaving cylinder visualisation...")
                 save_file(
-                    self.output_dir + "cleaned_cyl_vis.las", cleaned_cyl_vis, headers_of_interest=list(self.cyl_dict)
+                    self.output_dir + "cleaned_cyl_vis.las", cleaned_cyl_vis, headers_of_interest=self.cyl_vis_headers
                 )
 
         if radial_tree_aware_plot_cropping and self.parameters["generate_output_point_cloud"]:
@@ -2473,24 +2494,23 @@ class MeasureTree:
             self.plot_summary["Max Volume 2"] = np.max(tree_data["Volume_2"])
             self.plot_summary["Total Volume 2"] = np.sum(tree_data["Volume_2"])
 
-            self.plot_summary["Canopy Cover Fraction"] = self.canopy_cover_fraction
-
         else:
-            self.plot_summary["Mean DBH"] = 0
-            self.plot_summary["Median DBH"] = 0
-            self.plot_summary["Min DBH"] = 0
-            self.plot_summary["Max DBH"] = 0
+            # Zero the per-tree statistics under their real names. This used to
+            # write "Mean Volume", "Median Volume", "Min Volume" and "Max
+            # Volume", columns that exist nowhere else, so a plot without trees
+            # had four extra columns and misaligned when summaries were
+            # combined.
+            for statistic in ("Mean", "Median", "Min", "Max"):
+                for quantity in ("DBH", "Height", "Volume 1", "Volume 2"):
+                    self.plot_summary[f"{statistic} {quantity}"] = 0
+            self.plot_summary["Total Volume 1"] = 0
+            self.plot_summary["Total Volume 2"] = 0
 
-            self.plot_summary["Mean Height"] = 0
-            self.plot_summary["Median Height"] = 0
-            self.plot_summary["Min Height"] = 0
-            self.plot_summary["Max Height"] = 0
-
-            self.plot_summary["Mean Volume"] = 0
-            self.plot_summary["Median Volume"] = 0
-            self.plot_summary["Min Volume"] = 0
-            self.plot_summary["Max Volume"] = 0
-            self.plot_summary["Canopy Cover Fraction"] = 0
+        # Canopy cover is measured from the vegetation points, not the trees,
+        # so it is reported whether or not any trees were found. It used to be
+        # set to 0 for a plot without trees, unlike the understorey and CWD
+        # fractions below.
+        self.plot_summary["Canopy Cover Fraction"] = self.canopy_cover_fraction
 
         self.plot_summary["Avg Gradient"] = avg_gradient
         self.plot_summary["Avg Gradient X"] = avg_gradient_x

@@ -7,14 +7,13 @@ REM
 REM  Just double-click this file.
 REM
 REM  First run  : sets everything up by itself - conda environment,
-REM               PyTorch, FSCT dependencies, the browser UI packages
-REM               and LAStools. No questions asked.
-REM  Later runs : asks only what you want to launch.
+REM               PyTorch, FSCT dependencies and LAStools. No questions
+REM               asked - then starts the desktop app.
+REM  Later runs : start the desktop app straight away.
 REM
-REM  Advanced (not shown in the menu):
+REM  Advanced:
 REM      FSCT-Turbo.bat gui          launch the desktop app
-REM      FSCT-Turbo.bat web          launch the browser UI
-REM      FSCT-Turbo.bat setup        re-run setup, keeping the environment
+REM      FSCT-Turbo.bat setup       re-run setup, keeping the environment
 REM      FSCT-Turbo.bat setup /force rebuild the environment from scratch
 REM      FSCT-Turbo.bat verify       run the installation checks
 REM      FSCT-Turbo.bat lastools     re-download LAStools
@@ -43,7 +42,6 @@ for /f "tokens=2 delims==" %%v in ('findstr /b /c:"__version__" "%HERE%version.p
 )
 set "CONDA="
 set "RECREATE="
-set "MENUTRIES=0"
 
 REM Bumped whenever the package set changes, so an existing install is
 REM refreshed rather than silently left on the old stack.
@@ -54,7 +52,6 @@ if /i "%~2"=="/force"    set "RECREATE=1"
 if /i "%~2"=="/recreate" set "RECREATE=1"
 
 if /i "%~1"=="gui"       goto cmd_gui
-if /i "%~1"=="web"       goto cmd_web
 if /i "%~1"=="setup"     goto forced_setup
 if /i "%~1"=="install"   goto forced_setup
 if /i "%~1"=="verify"    goto cmd_verify
@@ -71,7 +68,7 @@ if not "%~1"=="" (
 
 
 REM ===================================================================
-REM  Default path: make sure everything is installed, then show the menu
+REM  Default path: make sure everything is installed, then start the app
 REM ===================================================================
 :auto
 call :find_conda
@@ -86,7 +83,7 @@ if not exist "%STAMP%" goto run_setup
 set "STAMPED="
 for /f "usebackq delims=" %%V in ("%STAMP%") do set "STAMPED=%%V"
 if not "!STAMPED!"=="%SETUP_VERSION%" goto run_setup
-goto menu
+goto cmd_gui
 
 :forced_setup
 call :find_conda
@@ -216,17 +213,15 @@ if errorlevel 1 (
 )
 echo.
 
-echo [5/6] Installing FSCT dependencies and both interfaces...
+echo [5/6] Installing FSCT dependencies and the desktop app...
 REM Everything else comes from requirements.txt - the single requirements
-REM file. Both interfaces are installed up front so the menu can offer
-REM either one without a separate step.
+REM file.
 REM
 REM By this point conda-forge has installed the scientific stack and pip has
 REM installed the torch triple, so this pass only adds what is still missing:
 REM mdutils/markdown for scripts\report_writer.py, python-louvain (imported
-REM as 'community') and scikit-spatial for scripts\measure.py, customtkinter
-REM for the desktop app, and streamlit/plotly/pydeck/statsmodels for the
-REM browser UI.
+REM as 'community') and scikit-spatial for scripts\measure.py, and
+REM customtkinter for the desktop app.
 REM
 REM Every bound in requirements.txt is open at the top precisely so this runs
 REM as a no-op against the conda-forge builds. The file previously capped
@@ -277,51 +272,17 @@ echo.
 echo ========================================
 echo   Setup complete
 echo ========================================
-echo.
-pause
-goto menu
+goto cmd_gui
 
 
 REM ===================================================================
-REM  Menu - the only thing regular runs show
-REM ===================================================================
-:menu
-set /a "MENUTRIES+=1"
-REM With redirected or closed stdin, set /p leaves PICK empty and this loop
-REM would spin forever. Bail out after a few dead reads.
-if !MENUTRIES! GTR 12 (
-    echo.
-    echo No input received - exiting.
-    exit /b 1
-)
-cls
-echo ========================================
-echo   FSCT - Forest Structural Complexity Tool  v%APP_VERSION%
-echo ========================================
-echo.
-echo   1.  Desktop app
-echo   2.  Browser UI
-echo.
-echo   0.  Exit
-echo.
-set "PICK="
-set /p "PICK=  Choose [0-2]: "
-if not "!PICK!"=="" set "MENUTRIES=0"
-
-if "!PICK!"=="1" goto cmd_gui
-if "!PICK!"=="2" goto cmd_web
-if "!PICK!"=="0" exit /b 0
-goto menu
-
-
-REM ===================================================================
-REM  Launchers
+REM  Launcher
 REM ===================================================================
 :cmd_gui
 call :require_env
 if errorlevel 1 goto fail
 echo.
-echo Starting the FSCT desktop app...
+echo Starting the FSCT desktop app  v%APP_VERSION%...
 echo.
 REM Run from the project directory so model\model.pth, gui_config.json and
 REM scripts\ resolve no matter where this was launched from.
@@ -333,24 +294,6 @@ if not "!EXITCODE!"=="0" (
     echo.
     echo ERROR: The application exited with code !EXITCODE!.
     echo If you see missing-module errors, run:  FSCT-Turbo.bat setup /force
-    goto fail
-)
-exit /b 0
-
-:cmd_web
-call :require_env
-if errorlevel 1 goto fail
-echo.
-echo The browser UI will open in your default browser.
-echo To stop the server, press Ctrl+C in this window.
-echo.
-pushd "%HERE%"
-"%CONDA%" run -n %ENV_NAME% --no-capture-output streamlit run fsct_web.py
-set "EXITCODE=!ERRORLEVEL!"
-popd
-if not "!EXITCODE!"=="0" (
-    echo.
-    echo ERROR: Streamlit exited with code !EXITCODE!.
     goto fail
 )
 exit /b 0
@@ -391,9 +334,8 @@ goto done
 echo.
 echo FSCT - Forest Structural Complexity Tool  v%APP_VERSION%
 echo.
-echo   FSCT-Turbo.bat                  set up if needed, then choose what to launch
+echo   FSCT-Turbo.bat                  set up if needed, then launch the desktop app
 echo   FSCT-Turbo.bat gui              launch the desktop app
-echo   FSCT-Turbo.bat web              launch the browser UI
 echo   FSCT-Turbo.bat setup            re-run setup, keeping the environment
 echo   FSCT-Turbo.bat setup /force     rebuild the environment from scratch
 echo   FSCT-Turbo.bat verify           run the installation checks

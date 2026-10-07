@@ -1,7 +1,7 @@
 """
 Single source of truth for the FSCT GUI version.
 
-Every surface that shows a version - the desktop sidebar, the browser UI footer,
+Every surface that shows a version - the desktop sidebar,
 `FSCT-Turbo.bat --version`, `batch_process.py --version` and the installation test -
 reads it from here, so a release is a one-line change. FSCT-Turbo.bat parses this file
 with findstr rather than importing it, since it needs the version before the

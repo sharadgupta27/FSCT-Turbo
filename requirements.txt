@@ -1,7 +1,7 @@
 # FSCT requirements - Python 3.11
 #
-# This is the single requirements file. It covers the core pipeline, the
-# desktop app (fsct_desktop.py) and the browser UI (fsct_web.py). There
+# This is the single requirements file. It covers the core pipeline and the
+# desktop app (fsct_desktop.py). There
 # used to be three files - requirements.txt, requirements_gui.txt and
 # requirements_wrapper.txt - plus a fourth hardcoded list inside
 # FSCT-Turbo.bat, which is how requirements.txt came to pin numpy<2.2 and
@@ -76,16 +76,6 @@ rdflib>=7.0
 # --- desktop app (fsct_desktop.py) -----------------------------------
 # Theming only. The app falls back to plain ttk if this is missing.
 customtkinter>=5.2.0
-
-# --- browser UI (fsct_web.py) ----------------------------------------
-# statsmodels enables the OLS trendline on the DBH-vs-Height scatter;
-# visualization_utils.py falls back to a plain scatter without it.
-# fsct_web.py passes download buttons a callable, so a point cloud is read
-# from disk only when its download is clicked; verified on 1.61.
-streamlit>=1.61
-plotly>=5.20
-pydeck>=0.9
-statsmodels>=0.14
 
 # --- misc ------------------------------------------------------------
 Pillow>=10.0

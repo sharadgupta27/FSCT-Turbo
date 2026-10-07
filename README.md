@@ -1,8 +1,7 @@
 # FSCT-Turbo
 
 A faster, reproducible build of the **Forest Structural Complexity Tool
-(FSCT)**, with a desktop application, a browser UI and a one-click Windows
-installer.
+(FSCT)**, with a desktop application and a one-click Windows installer.
 
 > **FSCT-Turbo is built on [FSCT](https://github.com/SKrisanski/FSCT) by Sean
 > Krisanski and colleagues** (University of Tasmania). The segmentation model,
@@ -34,26 +33,22 @@ release history is in [CHANGELOG.md](CHANGELOG.md).
 
 |                          | Original FSCT (version 0)                                    | FSCT-Turbo 1.0                                                     |
 | ------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------------ |
-| How you run it           | Edit parameters at the top of `scripts/run.py`, execute it   | Desktop app, browser UI, command line or unattended batch          |
+| How you run it           | Edit parameters at the top of `scripts/run.py`, execute it   | Desktop app, command line or unattended batch                      |
 | Installation             | Assemble the conda environment yourself                      | `FSCT-Turbo.bat` does it, asking nothing                           |
-| Example plot, end to end | 330 s                                                        | 34.3 s, **9.6x faster**                                            |
-| Measurement stage        | 304 s                                                        | 13.8 s, **22x faster**                                             |
+| Example plot, end to end | 529 s                                                        | 40.9 s, **12.9x faster** (9.6x on a quieter machine)               |
+| Measurement stage        | 498 s                                                        | 17.1 s, **29x faster** (22x on a quieter machine)                  |
 | One circle fit           | 2,039 ms                                                     | 29.4 ms, **69x faster**                                            |
-| Repeat runs on one file  | 7 to 8% of point labels differ                               | Bit-identical, at any core count and batch size                    |
+| Repeat runs on one file  | 7 to 9% of point labels differ                               | Bit-identical, at any core count and batch size                    |
 | CPU-only machines        | Worse segmentation than on a GPU; seed has no effect         | The network sees the same neighbourhoods as on a GPU               |
 | Large clouds             | 5.1 million points: `MemoryError` on a 16 GB machine         | Completes in 156 s                                                 |
 | `Volume_1`               | Wrong frustum formula, radii halved twice                    | Corrected                                                          |
 
-## User interfaces
+## Desktop application
 
 Upstream has no interface: you edit `scripts/run.py` and run it. FSCT-Turbo
-adds two, both launched from `FSCT-Turbo.bat` and sharing one conda
-environment.
-
-### Desktop application
-
-`fsct_desktop.py`, or `FSCT-Turbo.bat gui`. Five pages, selected from the
-sidebar; the file you are working on stays in the header on every page.
+adds a desktop application, `fsct_desktop.py`, which `FSCT-Turbo.bat` launches
+(also `FSCT-Turbo.bat gui`). Five pages, selected from the sidebar; the file
+you are working on stays in the header on every page.
 
 **Point Cloud.** Pick a LAS or LAZ file. Only the header is read, so even a
 multi-gigabyte file shows its point count, density, extent, height range and
@@ -85,31 +80,24 @@ appearance, and the Python, PyTorch and CUDA versions in use.
 
 ![Settings page](readme_images/desktop_settings.png)
 
-### Browser UI
-
-`fsct_web.py`, or `FSCT-Turbo.bat web`. The same pipeline as a Streamlit app,
-adding an interactive 3D point cloud, height and DBH distributions, a stem map
-and a DBH-height scatter (`visualization_utils.py`). Outputs download straight
-from the browser.
-
 ## Installation and tooling
 
 - **One-shot installation.** `FSCT-Turbo.bat` builds the conda environment,
   installs a matching PyTorch, PyTorch Geometric and torch-cluster set, installs
-  both interfaces and downloads LAStools, without asking anything. Subcommands:
-  `gui`, `web`, `setup`, `setup /force`, `verify`, `lastools`, `version`,
-  `help`.
+  the desktop app and downloads LAStools, without asking anything, then starts
+  the app. Subcommands: `gui`, `setup`, `setup /force`, `verify`, `lastools`,
+  `version`, `help`.
 - **Unattended batch processing** (`batch_process.py`): process a directory
   tree from the command line and combine the per-plot summaries into one CSV.
   Upstream's directory mode opens a folder dialog and cannot be scripted.
 - **LAStools integration** (`setup_lastools.py`): downloaded and configured
   automatically, with LAS/LAZ conversion, resampling and an external 3D viewer
-  in both interfaces.
+  in the desktop app.
 - **Installation self-test** (`test_installation.py`, `FSCT-Turbo.bat verify`):
   checks Python, the deep-learning stack, the linear-algebra routines, the
   point-cloud and reporting libraries, the core files, the FSCT imports, and
   the optional GPU, LAStools and UI components.
-- **One version number** (`version.py`), shown in both interfaces, the
+- **One version number** (`version.py`), shown in the desktop app, the
   installation test, `FSCT-Turbo.bat version` and `batch_process.py --version`.
 
 ## Performance
@@ -122,16 +110,22 @@ FSCT is [SKrisanski/FSCT](https://github.com/SKrisanski/FSCT) at `68e2f1e`,
 with library-compatibility edits only. Both ran with upstream's default
 parameters, batch size 2 and 8 workers. Runs were interleaved (original, Turbo
 fp32, Turbo fp16) and the sequence repeated twice, so each ratio compares runs
-made minutes apart. Absolute times on a busy workstation can move by a factor
-of two; the ratios hold.
+made minutes apart. Measured on FSCT-Turbo 1.0.0:
 
 | Stage           | Original FSCT | FSCT-Turbo, default (fp32) | FSCT-Turbo, `use_amp=True` (fp16) |
 | --------------- | ------------: | -------------------------: | --------------------------------: |
-| Preprocessing   |        3.68 s |              0.85 s (4.3x) |                     0.88 s (4.2x) |
-| Segmentation    |       21.17 s |            18.36 s (1.15x) |                   15.47 s (1.37x) |
-| Post-processing |        1.53 s |             1.32 s (1.16x) |                    1.24 s (1.23x) |
-| Measurement     |      304.07 s |            13.81 s (22.0x) |                   12.87 s (23.6x) |
-| **Total**       |  **330.46 s** |         **34.35 s (9.6x)** |               **30.46 s (10.8x)** |
+| Preprocessing   |        5.43 s |              1.16 s (4.7x) |                     1.17 s (4.6x) |
+| Segmentation    |       23.40 s |            20.87 s (1.12x) |                   17.55 s (1.33x) |
+| Post-processing |        2.21 s |             1.78 s (1.24x) |                    1.79 s (1.23x) |
+| Measurement     |      498.12 s |            17.09 s (29.1x) |                   14.51 s (34.3x) |
+| **Total**       |  **529.16 s** |        **40.90 s (12.9x)** |               **35.02 s (15.1x)** |
+
+The ratios move with background load, not just the absolute times. The machine
+was busy during these rounds, and the original's measurement stage, made of
+Python-level loops, slows down more under load than FSCT-Turbo's. An earlier
+interleaved session on a quieter machine, with a development build of the same
+measurement code, measured 330 s against 34.4 s: **9.6x**, which is the
+conservative figure to quote.
 
 fp16 is faster but not bit-exact, so it is off by default; see
 [Reproducibility](#reproducibility).
@@ -142,11 +136,17 @@ asymptotic cost:
 
 - **Circle fitting** dominated the original run. RANSAC trials are now formed,
   solved and scored as arrays instead of one Python loop iteration each, with
-  the same model, scoring and stopping rule.
+  the same model and scoring. On its own this is 2.6x; the trial cap and point
+  cap below give the rest.
 - **Box extraction** used a boolean scan of the whole cloud per box. It is now
   one shared k-d tree with a Chebyshev-ball query, which is exactly an
   axis-aligned cube, and the GIL is released so the worker threads run in
-  parallel.
+  parallel. The tree returns indices in its own traversal order, so they are
+  sorted before the gather and each box holds the same points in the same
+  order as the original scan. The order matters: the network keeps the first
+  64 neighbours by index, and a development build that gathered unsorted
+  labelled about 9% more of the example plot as stem than the original, well
+  outside the original's own run-to-run spread.
 - **Segmentation output** is moved off the GPU once per batch instead of seven
   blocking copies, four of them in a per-sample loop. Mixed precision (fp16) is
   available with `use_amp=True`.
@@ -202,7 +202,7 @@ other run of the same file with the same `random_seed`, whatever the CPU core
 count, the batch size, the order the filesystem lists files in, or whether it is
 the first or tenth plot in a batch.
 
-In the original code, repeat runs on the same file disagreed on 7 to 8% of
+In the original code, repeat runs on the same file disagreed on 7 to 9% of
 point labels, and a CPU-only machine segmented worse than a GPU. The causes,
 and what replaced each:
 
@@ -221,13 +221,15 @@ Set `random_seed=None` for the original non-reproducible behaviour.
 On the example plot, runs at batch size 1, 2 and 4, on 8 and 16 cores, in
 one process or a fresh one, all give the same 673,517 labels; a CPU run differs
 from a GPU run on 84 of them and measures the same four trees, with identical
-DBH and height. Repeat runs of the original differ on about
-50,000. [CHANGELOG.md](CHANGELOG.md) has the details.
+DBH and height. Repeat runs of the original differ on 50,000 to 63,000.
+FSCT-Turbo under different seeds differs from the original by the same amount
+as the original differs from itself (mean 9.2% against 9.1% over three runs
+each). [CHANGELOG.md](CHANGELOG.md) has the details.
 
 One option trades exactness for speed: `use_amp=True` runs segmentation in
 fp16, about 15% faster on that stage, but fp16 reductions are not
 bit-reproducible (2 of 673,517 labels differed between identical runs) and
-about 0.17% of labels differ from fp32. It is off by default.
+0.15% of labels (994) differ from fp32. It is off by default.
 
 What stays approximate is arithmetic across hardware: a CPU and a GPU, or two
 GPU generations, round floating-point sums differently, which can flip a
@@ -288,9 +290,7 @@ documented in the [original README](https://github.com/SKrisanski/FSCT#user-para
 | --------------------------------- | --------------------------------------------------------------------- |
 | `FSCT-Turbo.bat`                | Installer and launcher                                                |
 | `fsct_desktop.py`               | Desktop application                                                   |
-| `fsct_web.py`                   | Browser UI                                                            |
-| `fsct_job.py`                   | Default parameters; runs the pipeline in a process the UIs can stop   |
-| `visualization_utils.py`        | Plot builders for the browser UI                                      |
+| `fsct_job.py`                   | Default parameters; runs the pipeline in a process the app can stop   |
 | `batch_process.py`              | Unattended directory processing, configured by `wrapper_config.json` |
 | `setup_lastools.py`             | Downloads and configures LAStools                                     |
 | `test_installation.py`          | Installation checks                                                   |
@@ -321,9 +321,8 @@ FSCT-Turbo also builds on:
 - [PyTorch](https://pytorch.org/), [scikit-image](https://scikit-image.org/),
   [scikit-learn](https://scikit-learn.org/), [hdbscan](https://github.com/scikit-learn-contrib/hdbscan)
   and [laspy](https://github.com/laspy/laspy);
-- [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter),
-  [Streamlit](https://streamlit.io/) and [Plotly](https://plotly.com/python/)
-  for the interfaces;
+- [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) for the
+  desktop app;
 - [LAStools](https://rapidlasso.de/) by rapidlasso, which is downloaded
   separately and is subject to its own licence terms.
 

@@ -40,7 +40,7 @@ if __name__ == "__main__":
             # If you activate "tree aware plot cropping mode", this function will use it.
             ground_veg_cutoff_height=3,  # Any vegetation points below this height are considered to be understory and are not assigned to individual trees.
             veg_sorting_range=1.5,  # Vegetation points can be, at most, this far away from a cylinder horizontally to be matched to a particular tree.
-            stem_sorting_range=1,  # Stem points can be, at most, this far away from a cylinder in 3D to be matched to a particular tree.
+            stem_sorting_range=1,  # Not used, as in the original FSCT: stem points are matched to trees like vegetation, horizontally within veg_sorting_range (see measure.py). Kept so existing parameter sets still load.
             taper_measurement_height_min=0,  # Lowest height to measure diameter for taper output.
             taper_measurement_height_max=45,  # 30 (in original code)  # Highest height to measure diameter for taper output.
             taper_measurement_height_increment=0.2,  # diameter measurement increment.

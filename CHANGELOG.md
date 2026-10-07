@@ -6,6 +6,40 @@ for changes that alter measurements or break an existing workflow, MINOR for new
 capability that leaves results alone, PATCH for fixes with no effect on output.
 The version lives in `version.py`; `FSCT-Turbo.bat version` prints it.
 
+## Unreleased
+
+Not yet versioned. Removing an interface breaks an existing workflow, which
+by the rules above makes the next release a MAJOR one.
+
+- **The browser UI is removed.** `fsct_web.py`, its plot builders
+  `visualization_utils.py`, the `FSCT-Turbo.bat web` command and the
+  streamlit, plotly, pydeck and statsmodels requirements are gone. The desktop
+  app, the command line and `batch_process.py` remain. With one interface left,
+  `FSCT-Turbo.bat` no longer shows a menu: it sets up if needed and starts the
+  desktop app. An existing environment keeps the four packages until it is
+  rebuilt with `FSCT-Turbo.bat setup /force`; they are unused.
+- **A plot with no trees wrote a malformed summary.** That branch zeroed four
+  columns that exist nowhere else ("Mean Volume", "Median Volume", "Min
+  Volume", "Max Volume"), so the plot's `plot_summary.csv` had 49 columns
+  instead of 45 and misaligned when summaries were combined, and it reported
+  canopy cover as 0 although canopy is measured from the vegetation, not the
+  trees. It now zeroes the real per-tree columns and reports canopy cover
+  whether or not trees were found. Plots with trees are unaffected.
+- **The cylinder visualisation files** (`initial_cyl_vis.las`,
+  `cleaned_cyl_vis.las`) declared `nx`, `ny` and `nz` fields that were always
+  zero; they are no longer written. Every other field is unchanged.
+- **`stem_sorting_range` is documented as unused**, which is what it has always
+  been: stem points are matched to trees like vegetation, horizontally within
+  `veg_sorting_range`, here and in the original FSCT. Applying it as a 3D limit,
+  as its old description said, was tried and rejected: on the example plot it
+  dropped 44,322 of 164,553 stem points from the tree-segmented output, upper
+  stems that sit directly above a fitted cylinder but more than 1 m from one.
+- Documentation only: the README, the speed table below and
+  `readme_images/stage_times.png` now quote the release-1.0.0 measurements
+  (12.9x end to end, with 9.6x from a quieter machine as the conservative
+  figure), and neither the README nor the `ransac_circle` docstring claims any
+  longer that the batched RANSAC uses the original's stopping rule.
+
 ## 1.0.0
 
 The first release of FSCT-Turbo. Everything below is relative to the original
@@ -71,7 +105,7 @@ cores (176,992 stem points, 4 trees):
 | 16 cores, second run in the same process       | 0                               |
 | Complete default run in a fresh process        | 0                               |
 | CPU instead of GPU                             | 84 (212,634 before)             |
-| Original FSCT, against another original run    | 7 to 8%, about 50,000           |
+| Original FSCT, against another original run    | 7 to 9%, 50,000 to 63,000       |
 
 A complete CPU run measured the same four trees as the GPU run, with identical
 DBH, height, `Volume_2` and `CCI_at_BH`; `Volume_1` differed by at most
@@ -124,16 +158,17 @@ ratio comparing runs minutes apart:
 
 | Stage           |     Original | FSCT-Turbo (fp32, default) |   FSCT-Turbo (fp16) |
 | --------------- | -----------: | -------------------------: | ------------------: |
-| Preprocessing   |       3.68 s |              0.85 s (4.3x) |       0.88 s (4.2x) |
-| Segmentation    |      21.17 s |            18.36 s (1.15x) |     15.47 s (1.37x) |
-| Post-processing |       1.53 s |             1.32 s (1.16x) |      1.24 s (1.23x) |
-| Measurement     |     304.07 s |            13.81 s (22.0x) |     12.87 s (23.6x) |
-| **Total**       | **330.46 s** |         **34.35 s (9.6x)** | **30.46 s (10.8x)** |
+| Preprocessing   |       5.43 s |              1.16 s (4.7x) |       1.17 s (4.6x) |
+| Segmentation    |      23.40 s |            20.87 s (1.12x) |     17.55 s (1.33x) |
+| Post-processing |       2.21 s |             1.78 s (1.24x) |      1.79 s (1.23x) |
+| Measurement     |     498.12 s |            17.09 s (29.1x) |     14.51 s (34.3x) |
+| **Total**       | **529.16 s** |        **40.90 s (12.9x)** | **35.02 s (15.1x)** |
 
-These were timed before the consistency changes above, which add some index
-arithmetic per batch and turn TF32 off in fp32. Timed afterwards, alternating
-with the code before them, segmentation took 23.1 s against 22.0 s (three runs
-each, ranges 20.9 to 25.4 s and 19.0 to 23.5 s): within this machine's noise.
+Timed on this release, with the machine under background load, which slows the
+original's Python-level measurement loops more than FSCT-Turbo's. An earlier
+interleaved session on a quieter machine, before the consistency changes above,
+measured 330.46 s against 34.35 s (9.6x) and 30.46 s (10.8x) in fp16; 9.6x is
+the conservative figure.
 
 - **Circle fitting** was 92% of the original run: `skimage.measure.ransac` with
   `min_samples` at 30% of the slice and 10,000 trials, a combination for which

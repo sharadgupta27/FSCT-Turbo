@@ -209,9 +209,9 @@ class Parameters(unittest.TestCase):
         fsct_job.job_parameters(**config["default_parameters"])  # raises on an unknown key
 
     def test_ui_summary_columns_are_written_by_fsct(self):
-        # The browser UI once read columns FSCT never writes, and showed nothing.
+        # A UI once read columns FSCT never writes, and showed nothing.
         headers = read("scripts", "preprocessing.py")
-        for ui in ("fsct_web.py", "fsct_desktop.py"):
+        for ui in ("fsct_desktop.py",):
             source = read(ui)
             for column in ("Num Trees in Plot", "Stems/ha", "Mean DBH", "Mean Height", "Total Volume 1"):
                 self.assertIn(f"'{column}'", source, f"{ui} does not show {column}")

@@ -6,7 +6,7 @@ Run this only when the artwork changes:
     python make_icon.py
 
 It writes ``icon.ico`` (the Windows icon used by fsct_desktop.py and any
-shortcut) and ``icon.png`` (512 px, for the browser UI and the README).
+shortcut) and ``icon.png`` (512 px, for the desktop app's logo and the README).
 
 Design notes
 ------------

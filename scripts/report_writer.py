@@ -13,7 +13,7 @@ from tools import load_file
 #     likely fail.
 #
 # whenever the pipeline is not on the main thread - which is the normal case,
-# since fsct_desktop.py and fsct_web.py both run FSCT on a worker. In the
+# since fsct_desktop.py runs FSCT on a worker. In the
 # desktop app that is worse than a warning: TkAgg would drive the very same Tk
 # interpreter the GUI is using, from the wrong thread. Agg is a pure raster
 # renderer with no GUI attached, so report writing is safe from any thread.

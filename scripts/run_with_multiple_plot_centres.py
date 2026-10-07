@@ -45,7 +45,7 @@ if __name__ == "__main__":
             veg_sorting_range=1.5,
             # Vegetation points can be, at most, this far away from a cylinder horizontally to be matched to a particular tree.
             stem_sorting_range=1,
-            # Stem points can be, at most, this far away from a cylinder in 3D to be matched to a particular tree.
+            # Not used, as in the original FSCT: stem points are matched like vegetation, within veg_sorting_range.
             taper_measurement_height_min=0,  # Lowest height to measure diameter for taper output.
             taper_measurement_height_max=30,  # Highest height to measure diameter for taper output.
             taper_measurement_height_increment=0.2,  # diameter measurement increment.

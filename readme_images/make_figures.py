@@ -148,12 +148,15 @@ def overview(out_dir, input_las, dst):
 # Stage times on example.las, 673,517 points, 8 workers, batch size 2. Each
 # figure is the mean of two interleaved rounds (original, Turbo fp32, Turbo
 # fp16, repeated), so the ratios compare runs made minutes apart. Original FSCT
-# is SKrisanski/FSCT @ 68e2f1e with library-compatibility edits only.
+# is SKrisanski/FSCT @ 68e2f1e with library-compatibility edits only. Measured
+# on FSCT-Turbo 1.0.0 (paper/benchmark/results/stage_means.json); the machine
+# was under background load, which slows the original's Python loops more than
+# FSCT-Turbo - a quieter session gave 330 s against 34.4 s (9.6x).
 STAGES = ["Preprocessing", "Segmentation", "Post-processing", "Measurement"]
 STAGE_TIMES = {
-    "Original FSCT": [3.68, 21.17, 1.53, 304.07],
-    "FSCT-Turbo, default (fp32)": [0.85, 18.36, 1.32, 13.81],
-    "FSCT-Turbo, use_amp (fp16)": [0.88, 15.47, 1.24, 12.87],
+    "Original FSCT": [5.43, 23.40, 2.21, 498.12],
+    "FSCT-Turbo, default (fp32)": [1.16, 20.87, 1.78, 17.09],
+    "FSCT-Turbo, use_amp (fp16)": [1.17, 17.55, 1.79, 14.51],
 }
 
 
@@ -164,7 +167,7 @@ def stage_times(dst):
 
     fig, axes = plt.subplots(2, 1, figsize=(9, 4.6), gridspec_kw=dict(height_ratios=[3, 2], hspace=0.7))
     fig.subplots_adjust(left=0.22, right=0.97, top=0.78, bottom=0.11)
-    panels = [(axes[0], names, 345, "All runs"), (axes[1], names[1:], 42, "FSCT-Turbo runs, zoomed in")]
+    panels = [(axes[0], names, 560, "All runs"), (axes[1], names[1:], 50, "FSCT-Turbo runs, zoomed in")]
     for ax, rows, xmax, title in panels:
         for r, name in enumerate(rows):
             left = 0.0

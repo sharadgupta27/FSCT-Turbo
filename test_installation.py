@@ -249,7 +249,6 @@ def main():
         ("GPU / CUDA", test_cuda),
         ("LAStools", test_lastools),
         ("CustomTkinter", lambda: test_import("customtkinter", "CustomTkinter")),
-        ("Streamlit (browser UI)", lambda: test_import("streamlit", "Streamlit")),
     ]:
         passed, message = check()
         print_result(label, passed, message)

@@ -35,8 +35,8 @@ import weakref
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # The user parameters every run needs, with the defaults of upstream FSCT's
-# scripts/run.py. This is the one copy: the desktop app, the browser UI and
-# batch_process.py all start from it, so a parameter added here reaches every
+# scripts/run.py. This is the one copy: the desktop app and batch_process.py
+# both start from it, so a parameter added here reaches every
 # entry point. wrapper_config.json overrides it for batch runs only.
 DEFAULT_PARAMETERS = dict(
     plot_centre=None,  # [X, Y], or None for the centre of the cloud's bounding box
@@ -53,7 +53,7 @@ DEFAULT_PARAMETERS = dict(
     generate_output_point_cloud=1,
     ground_veg_cutoff_height=3,
     veg_sorting_range=1.5,
-    stem_sorting_range=1,
+    stem_sorting_range=1,  # unused, as in the original: stems sort within veg_sorting_range
     taper_measurement_height_min=0,
     taper_measurement_height_max=30,
     taper_measurement_height_increment=0.2,
